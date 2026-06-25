@@ -1,0 +1,7 @@
+*.log
+
+*.npz
+
+tensorboard*
+
+*model/

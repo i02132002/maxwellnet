@@ -1,0 +1,23 @@
+[tool.poetry]
+name = "maxwellnet"
+version = "0.1.0"
+description = ""
+authors = ["Your Name <you@example.com>"]
+readme = "README.md"
+packages = [{include = "maxwellnet"}]
+
+[tool.poetry.dependencies]
+python = ">=3.12,<3.13"
+torch = "^2.6.0"
+numpy = "<2.0.0"
+torchvision = ">=0.15.0"
+scikit-image = ">=0.24.0"
+jupyter = ">=1.0.0"
+matplotlib = ">=3.10.0"
+tensorboard = ">=2.12.0"
+plyfile = ">=0.7.4"
+periodictable = ">=2.1.0,<3.0.0"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
