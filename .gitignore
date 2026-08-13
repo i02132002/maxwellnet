@@ -5,3 +5,5 @@
 tensorboard*
 
 *model/
+
+test_data/

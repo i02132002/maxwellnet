@@ -30,6 +30,17 @@ SOFTWARE.
 
 import torch
 from torch import nn
+import torch.nn.functional as F
+
+
+class CircularXReplicateZPad2d(nn.Module):
+    """Pads 1 pixel circular (periodic) along x (width) and 1 pixel
+    replicate along z (height, the second-to-last dim)."""
+
+    def forward(self, x):
+        x = F.pad(x, (1, 1, 0, 0), mode='circular')
+        x = F.pad(x, (0, 0, 1, 1), mode='replicate')
+        return x
 
 
 class UNet(nn.Module):
@@ -82,11 +93,11 @@ class UNetConvBlock(nn.Module):
         super(UNetConvBlock, self).__init__()
         block = []
         if norm == 'weight':
-            block.append(nn.ReplicationPad2d(1))
+            block.append(CircularXReplicateZPad2d())
             block.append(nn.utils.weight_norm((nn.Conv2d(in_size, out_size[0], kernel_size=int(kersize),
                                                          padding=int(0), bias=True)), name='weight'))
             block.append(nn.CELU())
-            block.append(nn.ReplicationPad2d(1))
+            block.append(CircularXReplicateZPad2d())
             block.append(nn.utils.weight_norm((nn.Conv2d(out_size[0], out_size[1], kernel_size=int(kersize),
                                                          padding=int(0), bias=True)), name='weight'))
         elif norm == 'batch':
@@ -102,11 +113,11 @@ class UNetConvBlock(nn.Module):
             block.append(nn.BatchNorm2d(out_size[1]))
 
         elif norm == 'no':
-            block.append(nn.ReplicationPad2d(1))
+            block.append(CircularXReplicateZPad2d())
             block.append((nn.Conv2d(in_size, out_size[0], kernel_size=int(kersize),
                                     padding=int(0), bias=True)))
             block.append(nn.CELU())
-            block.append(nn.ReplicationPad2d(1))
+            block.append(CircularXReplicateZPad2d())
             block.append((nn.Conv2d(out_size[0], out_size[1], kernel_size=int(kersize),
                                     padding=int(0), bias=True)))
 

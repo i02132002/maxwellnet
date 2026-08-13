@@ -1,11 +1,12 @@
 # Copyright (c) 2022 Joowon Lim, limjoowon@gmail.com
 
 import torch
-from Dataset import LensDataset
+from Dataset import ShapeDataset
+from ShapeNet import PeriodicMaxwellNet
+from losses.helmholtz_checker import helmholtz_residual_loss_periodic_pml
 import torch.backends.cudnn as cudnn
 from torch.optim.lr_scheduler import StepLR
 from torch.utils.tensorboard import SummaryWriter
-from MaxwellNet import MaxwellNet
 
 import numpy as np
 import random
@@ -16,7 +17,8 @@ import json
 from datetime import datetime
 
 
-def main(directory, load_ckpt):
+def main(load_ckpt):
+    directory = "test_run1"
     logging.basicConfig(level=logging.DEBUG,
                         format='%(asctime)s %(filename)s[line:%(lineno)d] %(levelname)s %(message)s',
                         datefmt='%a, %d %b %Y %H:%M:%S',
@@ -26,7 +28,7 @@ def main(directory, load_ckpt):
 
     logging.info("training " + directory)
 
-    specs_filename = os.path.join(directory, 'specs_maxwell.json')
+    specs_filename = os.path.join('specs_maxwell.json')
 
     if not os.path.isfile(specs_filename):
         raise Exception(
@@ -46,7 +48,11 @@ def main(directory, load_ckpt):
                  ' '.join([str(elem) for elem in specs["Description"]]))
     logging.info("Training with " + str(device))
 
-    model = MaxwellNet(**specs["NetworkSpecs"], **specs["PhysicalSpecs"])
+    physical_specs = specs["PhysicalSpecs"]
+    mode = physical_specs['mode']
+    pml_thickness = physical_specs['pml_thickness']
+
+    model = PeriodicMaxwellNet(**specs["NetworkSpecs"], mode=mode)
     if torch.cuda.device_count() > 1:
         logging.info("Multiple GPUs: " + str(torch.cuda.device_count()))
     if load_ckpt is not None:
@@ -71,33 +77,31 @@ def main(directory, load_ckpt):
         specs, "LearningRateDecayStep", 10000), gamma=get_spec_with_default(specs, "LearningRateDecay", 1.0))
 
     batch_size = get_spec_with_default(specs, "BatchSize", 1)
+    assert batch_size == 1, (
+        "ShapeDataset samples have varying grid sizes, so only BatchSize=1 is supported.")
     epochs = get_spec_with_default(specs, "Epochs", 1)
     snapshot_freq = specs["SnapshotFrequency"]
-    physical_specs = specs["PhysicalSpecs"]
-    symmetry_x = physical_specs['symmetry_x']
-    mode = physical_specs['mode']
-    high_order = physical_specs['high_order']
 
     checkpoints = list(range(snapshot_freq, epochs + 1, snapshot_freq))
 
-    filename = 'maxwellnet_' + mode + '_' + high_order
+    filename = 'maxwellnet_' + mode
     writer = SummaryWriter(os.path.join(directory, 'tensorboard_' + filename))
     writer_freq = get_spec_with_default(specs, "TensorboardFrequency", None)
 
-    train_dataset = LensDataset(directory, 'train')
+    hf_config = get_spec_with_default(specs, "HFConfig", "validation")
+    valid_fraction = get_spec_with_default(specs, "ValidFraction", 0.1)
+    train_dataset, valid_dataset = ShapeDataset.load_train_valid(
+        hf_config, mode, valid_fraction, seed_number if seed_number is not None else 0)
+
     train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size,
                                                shuffle=True, pin_memory=True, sampler=None)
     logging.info("Train Dataset length: {}".format(len(train_dataset)))
     loss_train = torch.zeros(
         (int(epochs),), dtype=torch.float32, requires_grad=False)
 
-    if len(train_dataset) > 1:
-        perform_valid = True
-    else:
-        perform_valid = False
+    perform_valid = len(valid_dataset) > 0
 
     if perform_valid == True:
-        valid_dataset = LensDataset(directory, 'valid')
         valid_loader = torch.utils.data.DataLoader(valid_dataset, batch_size=batch_size,
                                                    shuffle=True, pin_memory=True, sampler=None)
         logging.info("Valid Dataset length: {}".format(len(valid_dataset)))
@@ -118,12 +122,12 @@ def main(directory, load_ckpt):
 
     for epoch in range(start_epoch + 1, epochs + 1):
         train(train_loader, model, optimizer, epoch, loss_train,
-              device, mode, symmetry_x, writer, writer_freq)
+              device, mode, pml_thickness, writer, writer_freq)
         logging.info("[Train] {} epoch. Loss: {:.5f}".format(
             epoch, loss_train[epoch-1].item())) if rank == 0 else None
         if perform_valid:
             valid(valid_loader, model, epoch, loss_valid,
-                  device, mode, symmetry_x, writer, writer_freq)
+                  device, mode, pml_thickness, writer, writer_freq)
             logging.info("[Valid] {} epoch. Loss: {:.5f}".format(
                 epoch, loss_valid[epoch-1].item())) if rank == 0 else None
 
@@ -137,7 +141,7 @@ def main(directory, load_ckpt):
                     'optimizer': optimizer.state_dict(),
                     'loss_train': loss_train,
                     'scheduler': scheduler.state_dict(),
-                }, directory, str(epoch) + '_' + mode + '_' + high_order)
+                }, directory, str(epoch) + '_' + mode)
 
         if epoch % 200 == 0:
             logging.info("'latest' checkpoint saved at {} epoch.".format(
@@ -156,99 +160,89 @@ def main(directory, load_ckpt):
     writer.close() if rank == 0 else None
 
 
-def train(train_loader, model, optimizer, epoch, loss_train, device, mode, symmetry, writer, writer_freq):
+def _compute_loss(data, model, device, mode, pml_thickness):
+    optical_constant = data['optical_constant'].to(device)
+    pol = data['pol'][0]
+    wavelength_a = data['wavelength_nm'].item() * 10.0
+    delta_x_a = data['delta_x_a'].item()
+    delta_z_a = data['delta_z_a'].item()
+
+    field_pred, epsilon_map = model(optical_constant)
+
+    residual = helmholtz_residual_loss_periodic_pml(
+        field_pred[0], epsilon_map[0], pol, wavelength_a, delta_x_a, delta_z_a, pml_thickness)
+
+    loss = torch.mean(residual.abs().pow(2))
+    return loss, field_pred[0]
+
+
+def train(train_loader, model, optimizer, epoch, loss_train, device, mode, pml_thickness, writer, writer_freq):
     model.train()
     with torch.set_grad_enabled(True):
         count = 0
 
         for data in train_loader:
-            scat_pot_torch = data[0].to(device)
-            ri_value_torch = data[1].to(device)
+            loss, field_pred = _compute_loss(data, model, device, mode, pml_thickness)
 
-            (diff, total) = model(scat_pot_torch, ri_value_torch)
-
-            l2 = diff.pow(2)
-            loss = torch.mean(l2)
             optimizer.zero_grad()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1e-3)
             optimizer.step()
 
-            loss_train[epoch-1] += loss.item() * diff.size(0)
-            count += diff.size(0)
+            loss_train[epoch-1] += loss.item()
+            count += 1
 
         loss_train[epoch-1] = loss_train[epoch-1] / count
 
     if epoch % writer_freq == 0 and writer != None:
-        to_tensorboard(total.permute(2, 3, 1, 0)[:, :, :, 0].clone().detach().cpu(), loss_train[epoch-1].numpy(), epoch,
-                       mode, symmetry, writer, 'train')
+        to_tensorboard(field_pred.clone().detach().cpu(), loss_train[epoch-1].numpy(), epoch,
+                       mode, writer, 'train')
 
 
-def valid(valid_loader, model, epoch, loss_valid, device, mode, symmetry, writer, writer_freq):
+def valid(valid_loader, model, epoch, loss_valid, device, mode, pml_thickness, writer, writer_freq):
     model.eval()
     with torch.set_grad_enabled(False):
         count = 0
 
         for data in valid_loader:
-            scat_pot_torch = data[0].to(device)
-            ri_value_torch = data[1].to(device)
+            loss, field_pred = _compute_loss(data, model, device, mode, pml_thickness)
 
-            (diff, total) = model(scat_pot_torch,
-                                  ri_value_torch)  # [N, 1, H, W, D]
-
-            l2 = diff.pow(2)
-            loss = torch.mean(l2)
-
-            loss_valid[epoch-1] += loss.item() * diff.size(0)
-            count += diff.size(0)
+            loss_valid[epoch-1] += loss.item()
+            count += 1
 
         loss_valid[epoch-1] = loss_valid[epoch-1] / count
 
     if epoch % writer_freq == 0 and writer != None:
-        to_tensorboard(total.permute(2, 3, 1, 0)[:, :, :, 0].clone().detach().cpu(), loss_valid[epoch-1].numpy(), epoch,
-                       mode, symmetry, writer, 'valid')
+        to_tensorboard(field_pred.clone().detach().cpu(), loss_valid[epoch-1].numpy(), epoch,
+                       mode, writer, 'valid')
 
 
-def to_tensorboard(image, losses, epoch, mode, symmetry, writer, train_valid):
-    if symmetry is True:
-        if mode == 'te':
-            y_pol = torch.cat((torch.flip(image, [0])[0:-1:, :, :], image), 0)
-        elif mode == 'tm':
-            x_pol = torch.cat((torch.flip(image, [0]), image), 0)
-            z_pol = torch.cat((-torch.flip(image, [0])[0:-1, :, :], image), 0)
-
+def to_tensorboard(field, losses, epoch, mode, writer, train_valid):
     if mode == 'te':
-        polarization = ['y']
-    elif mode == 'tm':
-        polarization = ['x', 'z']
+        fields = [field]
+        labels = ['y']
+    else:
+        fields = [field[0], field[1]]
+        labels = ['z', 'x']
 
-    for idx in range(len(polarization)):
-        if symmetry == True:
-            if polarization[idx] == 'y':
-                image = y_pol
-            elif polarization[idx] == 'x':
-                image = x_pol
-            elif polarization[idx] == 'z':
-                image = z_pol
-
-        amplitude = torch.sum(
-            image[:, :, idx*2:(idx+1)*2].pow(2), 2).pow(1 / 2)
+    for label, f in zip(labels, fields):
+        amplitude = f.abs()
         amplitude = amplitude - torch.min(amplitude)
         amplitude = amplitude / torch.max(amplitude)
         writer.add_image(train_valid + '/' + mode + '/amplitude_' +
-                         polarization[idx], amplitude.unsqueeze(0), epoch)
+                         label, amplitude.unsqueeze(0), epoch)
 
-        real = image[:, :, idx*2]
+        real = f.real
         real = real - torch.min(real)
         real = real / torch.max(real)
         writer.add_image(train_valid + '/' + mode + '/real_' +
-                         polarization[idx], real.unsqueeze(0), epoch)
+                         label, real.unsqueeze(0), epoch)
 
-        imaginary = image[:, :, idx*2+1]
+        imaginary = f.imag
         imaginary = imaginary - torch.min(imaginary)
         imaginary = imaginary / torch.max(imaginary)
         writer.add_image(train_valid + '/' + mode + '/imaginary_' +
-                         polarization[idx], imaginary.unsqueeze(0), epoch)
+                         label, imaginary.unsqueeze(0), epoch)
 
     writer.add_scalar(train_valid + '/' + mode, losses, epoch)
 
@@ -281,15 +275,6 @@ def get_spec_with_default(specs, key, default):
 if __name__ == '__main__':
     arg_parser = argparse.ArgumentParser(description="Train a MaxwellNet")
     arg_parser.add_argument(
-        "--directory",
-        "-d",
-        required=True,
-        default='examples\spheric_te',
-        help="This directory should include "
-             + "all the training and network parameters in 'specs_maxwell.json', and logging will be "
-             + "done in this directory as well.",
-    )
-    arg_parser.add_argument(
         "--load_ckpt",
         "-l",
         default=None,
@@ -297,4 +282,4 @@ if __name__ == '__main__':
     )
 
     args = arg_parser.parse_args()
-    main(args.directory, args.load_ckpt)
+    main(args.load_ckpt)

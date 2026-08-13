@@ -10,7 +10,7 @@ from numpy._typing import _64Bit
 from periodictable.xsf import index_of_refraction
 from refloxide.pxr.tjf4x4 import hc
 from refloxide.pxr.stacks import Layer, Material, stack_slabs, stack_tensor
-from test_data.helmholtz_checker import calculate_helmholtz_diff
+from losses.helmholtz_checker import helmholtz_residual_loss
 
 ENERGY_EV = 250.0
 FILM_NM = 200.0
@@ -235,8 +235,8 @@ if __name__ == "__main__":
     E_p = torch.stack([Ez_p, Ex_p], dim=0)
 
     eps_map = torch.Tensor(eps_map)
-    error_s = calculate_helmholtz_diff(Ey_s, eps_map[0,0], "s", wavelength_a, delta_z_a, delta_x_a)
-    error_p = calculate_helmholtz_diff(E_p, eps_map[0], "p", wavelength_a, delta_z_a, delta_x_a)
+    error_s = helmholtz_residual_loss(Ey_s, eps_map[0,0], "s", wavelength_a, delta_z_a, delta_x_a)
+    error_p = helmholtz_residual_loss(E_p, eps_map[0], "p", wavelength_a, delta_z_a, delta_x_a)
 
     # trim the axes to match the (Nz-4, Nx-4) interior output
     x_nm_interior = x_nm[2:-2]
