@@ -44,7 +44,7 @@ class CircularXReplicateZPad2d(nn.Module):
 
 
 class UNet(nn.Module):
-    def __init__(self, in_channels=1, out_channels=2, depth=5, wf=6, norm='weight', up_mode='upconv'):
+    def __init__(self, in_channels=1, out_channels=2, depth=5, wf=6, norm='weight', up_mode='upconv', cond_channels=0):
         super(UNet, self).__init__()
         assert up_mode in ('upconv', 'upsample')
         self.down_path = nn.ModuleList()
@@ -64,7 +64,7 @@ class UNet(nn.Module):
                 self.down_path.append(nn.AvgPool2d(2))
             else:
                 self.down_path.append(UNetConvBlock(
-                    prev_channels, [wf * (2 ** i), wf * (2 ** (i - 1))], 3, 0, norm))
+                    prev_channels + cond_channels, [wf * (2 ** i), wf * (2 ** (i - 1))], 3, 0, norm))
                 prev_channels = int(wf * (2 ** (i - 1)))
 
         for i in reversed(range(depth - 1)):
@@ -75,12 +75,16 @@ class UNet(nn.Module):
         self.last_conv = nn.Conv2d(
             prev_channels, out_channels, kernel_size=1, padding=0, bias=False)
 
-    def forward(self, scat_pot):
+    def forward(self, scat_pot, cond=None):
         blocks = []
         x = scat_pot
+        n = len(self.down_path)
         for i, down in enumerate(self.down_path):
+            if i == n - 1 and cond is not None:
+                cond_map = cond[:, :, None, None].expand(-1, -1, x.shape[-2], x.shape[-1])
+                x = torch.cat([x, cond_map], dim=1)
             x = down(x)
-            if i % 2 == 0 and i != (len(self.down_path) - 1):
+            if i % 2 == 0 and i != (n - 1):
                 blocks.append(x)
         for i, up in enumerate(self.up_path):
             x = up(x, blocks[-i - 1])

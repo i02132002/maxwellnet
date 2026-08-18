@@ -15,14 +15,19 @@
     "mode": "te",
     "pml_thickness": 8
   },
-  "HFConfig": "validation",
+  "HFConfig": null,
   "ValidFraction": 0.1,
   "Seed": 2,
   "LearningRate": 0.0005,
   "LearningRateDecay": 0.5,
-  "LearningRateDecayStep": 50000,
-  "Epochs": 20,
-  "BatchSize": 1,
+  "LearningRateDecayStep": 50,
+  "Epochs": 100,
+  "BatchSize": 16,
   "SnapshotFrequency": 3,
-  "TensorboardFrequency": 1
+  "WandB": {
+    "Project": "maxwellnet",
+    "Entity": "als-rixs",
+    "Mode": "online",
+    "LogFrequency": 1
+  }
 }
