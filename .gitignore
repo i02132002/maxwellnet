@@ -1,3 +1,4 @@
 test_run1/
 test_data/
 examples/
+__pycache__/
