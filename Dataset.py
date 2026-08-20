@@ -81,6 +81,11 @@ class ShapeDataset(torch.utils.data.Dataset):
 
         optical_constant = (np.asarray(r["optical_constant_real"])
                             + 1j * np.asarray(r["optical_constant_imag"]))
+        # Crop off the last row/column (e.g. 257x257 -> 256x256) so the grid
+        # size is a clean power of two -- both ShapeNet (UNet pooling) and
+        # helmholtz_checker (periodic-x/PML-z residual) consume this same
+        # cropped array, so they see a consistent grid.
+        optical_constant = optical_constant[:-1, :-1, :]
 
         delta_x_a = 1.0
         delta_z_a = 1.0
@@ -92,8 +97,8 @@ class ShapeDataset(torch.utils.data.Dataset):
             "x0_A": r["x0_A"],
             "y0_A": r["y0_A"],
             "z0_A": r["z0_A"],
-            "grid_nx": r["grid_nx"],
-            "grid_ny": r["grid_ny"],
+            "grid_nx": r["grid_nx"] - 1,
+            "grid_ny": r["grid_ny"] - 1,
             "pol": r["pol"],
             "theta": r["theta"],
             "delta_x_a": delta_x_a,

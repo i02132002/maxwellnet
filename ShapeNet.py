@@ -50,6 +50,10 @@ class PeriodicMaxwellNet(nn.Module):
         channels = 2 if mode == 'te' else 4
         self.model = UNet(channels, channels, depth, filter, norm, up_mode,
                           cond_channels=self._COND_CHANNELS)
+        # Zero-init the last layer so the network starts at the zeroth-order
+        # Born approximation (scattered envelope a=0 -> E=E_i) rather than
+        # an arbitrary random scattered field.
+        nn.init.zeros_(self.model.last_conv.weight)
         self._divisor = 2 ** (depth - 1)
         # X-ray refractive-index contrast (eps - 1) is tiny (~1e-2 or smaller)
         # in this dataset, easily swamped by the eps=1 background when fed

@@ -281,7 +281,7 @@ def helmholtz_residual_loss_periodic_pml(
     dx = delta_x_a
     dz = delta_z_a
 
-    pml_strength = 25.3125 / pml_thickness**4
+    pml_strength = 5
 
     def _pad_z(f: Tensor, n: int) -> Tensor:
         return F.pad(f, (0, 0, n, n), mode='replicate')
