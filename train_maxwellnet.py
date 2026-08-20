@@ -21,7 +21,7 @@ import json
 from datetime import datetime
 
 
-def main(load_ckpt):
+def main(load_ckpt, reset_lr=False, epochs_override=None, n_samples=None, skip_valid=False):
     directory = "test_run1"
     logging.basicConfig(level=logging.DEBUG,
                         format='%(asctime)s %(filename)s[line:%(lineno)d] %(levelname)s %(message)s',
@@ -57,6 +57,11 @@ def main(load_ckpt):
     physical_specs = specs["PhysicalSpecs"]
     mode = physical_specs['mode']
     pml_thickness = physical_specs['pml_thickness']
+    # A flat mean loss lets the (much larger, and trivially correct) eps=1
+    # background dominate training and drag the object region back towards
+    # matching the incident wave too -- upweight object pixels directly.
+    object_weight = get_spec_with_default(specs, "ObjectWeight", 20.0)
+    object_threshold = get_spec_with_default(specs, "ObjectThreshold", 1e-4)
 
     model = PeriodicMaxwellNet(**specs["NetworkSpecs"], mode=mode)
     if torch.cuda.device_count() > 1:
@@ -86,7 +91,7 @@ def main(load_ckpt):
         specs, "LearningRateDecayStep", 10000), gamma=get_spec_with_default(specs, "LearningRateDecay", 1.0))
 
     batch_size = get_spec_with_default(specs, "BatchSize", 1)
-    epochs = get_spec_with_default(specs, "Epochs", 1)
+    epochs = epochs_override if epochs_override is not None else get_spec_with_default(specs, "Epochs", 1)
     snapshot_freq = specs["SnapshotFrequency"]
 
     checkpoints = list(range(snapshot_freq, epochs + 1, snapshot_freq))
@@ -111,24 +116,33 @@ def main(load_ckpt):
 
     hf_config = get_spec_with_default(specs, "HFConfig", None)
     valid_fraction = get_spec_with_default(specs, "ValidFraction", 0.1)
+    n_samples = n_samples if n_samples is not None else get_spec_with_default(specs, "NumTrainSamples", None)
+    skip_valid = skip_valid or get_spec_with_default(specs, "SkipValid", False)
     train_dataset, valid_dataset = ShapeDataset.load_train_valid(
-        hf_config, mode, valid_fraction, seed_number if seed_number is not None else 0)
+        hf_config, mode, valid_fraction, seed_number if seed_number is not None else 0, n_samples=n_samples)
 
     # Fetching a sample means decoding an HF Arrow row (numpy conversion of
     # the optical_constant array), which is CPU-bound and otherwise
     # serializes with GPU/MPS compute; worker processes overlap it instead.
     num_workers = get_spec_with_default(specs, "NumWorkers", min(8, os.cpu_count() or 0))
+    # Cap below the dataset size so an overfitting run (n_samples small)
+    # doesn't spin up worker processes it has nothing to hand them.
+    train_num_workers = min(num_workers, len(train_dataset))
+    train_loader_kwargs = dict(num_workers=train_num_workers, pin_memory=(device.type == "cuda"))
+    if train_num_workers > 0:
+        train_loader_kwargs.update(persistent_workers=True, prefetch_factor=4)
+
     loader_kwargs = dict(num_workers=num_workers, pin_memory=(device.type == "cuda"))
     if num_workers > 0:
         loader_kwargs.update(persistent_workers=True, prefetch_factor=4)
 
     train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size,
-                                               shuffle=True, sampler=None, **loader_kwargs)
+                                               shuffle=(n_samples != 1), sampler=None, **train_loader_kwargs)
     logging.info("Train Dataset length: {}".format(len(train_dataset)))
     loss_train = torch.zeros(
         (int(epochs),), dtype=torch.float32, requires_grad=False)
 
-    perform_valid = len(valid_dataset) > 0
+    perform_valid = len(valid_dataset) > 0 and not skip_valid
 
     if perform_valid == True:
         valid_loader = torch.utils.data.DataLoader(valid_dataset, batch_size=batch_size,
@@ -138,8 +152,15 @@ def main(load_ckpt):
             (int(epochs),), dtype=torch.float32, requires_grad=False)
 
     if load_ckpt is not None:
-        optimizer.load_state_dict(ckpt_dict['optimizer'])
-        scheduler.load_state_dict(ckpt_dict['scheduler'])
+        if reset_lr:
+            new_lr = get_spec_with_default(specs, "LearningRate", 0.0001)
+            for group in optimizer.param_groups:
+                group['lr'] = new_lr
+            logging.info("Resetting LR to {} and restarting decay schedule from {}-epoch".format(
+                new_lr, ckpt_epoch))
+        else:
+            optimizer.load_state_dict(ckpt_dict['optimizer'])
+            scheduler.load_state_dict(ckpt_dict['scheduler'])
         loss_train[:ckpt_epoch:] = ckpt_dict['loss_train'][:ckpt_epoch:]
         logging.info("Check point loaded from {}-epoch".format(ckpt_epoch))
 
@@ -151,12 +172,12 @@ def main(load_ckpt):
 
     for epoch in range(start_epoch + 1, epochs + 1):
         train(train_loader, model, optimizer, epoch, loss_train,
-              device, mode, pml_thickness, log_freq)
+              device, mode, pml_thickness, log_freq, object_weight, object_threshold)
         logging.info("[Train] {} epoch. Loss: {:.5f}".format(
             epoch, loss_train[epoch-1].item())) if rank == 0 else None
         if perform_valid:
             valid(valid_loader, model, epoch, loss_valid,
-                  device, mode, pml_thickness, log_freq)
+                  device, mode, pml_thickness, log_freq, object_weight, object_threshold)
             logging.info("[Valid] {} epoch. Loss: {:.5f}".format(
                 epoch, loss_valid[epoch-1].item())) if rank == 0 else None
 
@@ -193,7 +214,8 @@ def main(load_ckpt):
     wandb.finish() if rank == 0 else None
 
 
-def _compute_loss(data, model, device, mode, pml_thickness):
+def _compute_loss(data, model, device, mode, pml_thickness,
+                  object_weight=1.0, object_threshold=1e-4):
     optical_constant = data['optical_constant'].to(torch.complex64).to(device)
     pol = data['pol'][0]
     # wavelength/grid spacing are the same across a batch (ShapeDataset
@@ -203,7 +225,7 @@ def _compute_loss(data, model, device, mode, pml_thickness):
     delta_x_a = data['delta_x_a'][0].item()
     delta_z_a = data['delta_z_a'][0].item()
 
-    field_pred, epsilon_map, incident, kz = model(
+    field_pred, epsilon_map, incident, kz, kx = model(
         optical_constant,
         data['theta'].to(torch.float32).to(device),
         data['wavelength_nm'].to(torch.float32).to(device),
@@ -212,13 +234,20 @@ def _compute_loss(data, model, device, mode, pml_thickness):
     )
 
     residual = helmholtz_residual_loss_periodic_pml(
-        field_pred, epsilon_map, incident, kz, pol, wavelength_a, delta_x_a, delta_z_a, pml_thickness)
+        field_pred, epsilon_map, incident, kz, kx, pol, wavelength_a, delta_x_a, delta_z_a, pml_thickness)
 
-    loss = torch.mean(residual.abs().pow(2))
+    # A flat mean lets the (much larger, trivially-correct) eps=1 background
+    # dominate training and drag the object region back towards matching
+    # the incident wave too. Upweight object pixels directly.
+    is_object = (epsilon_map - 1.0).abs() > object_threshold
+    weight = torch.where(is_object, object_weight, 1.0)
+
+    loss = torch.mean(weight * residual.abs().pow(2))
     return loss, field_pred, residual, incident
 
 
-def train(train_loader, model, optimizer, epoch, loss_train, device, mode, pml_thickness, log_freq):
+def train(train_loader, model, optimizer, epoch, loss_train, device, mode, pml_thickness, log_freq,
+          object_weight=1.0, object_threshold=1e-4):
     model.train()
     n_batches = len(train_loader)
     log_field_pred = log_residual = log_incident = log_sample_ids = None
@@ -227,19 +256,20 @@ def train(train_loader, model, optimizer, epoch, loss_train, device, mode, pml_t
 
         pbar = tqdm(train_loader, desc=f"Epoch {epoch} [train]", leave=False)
         for batch_idx, data in enumerate(pbar):
-            loss, field_pred, residual, incident = _compute_loss(data, model, device, mode, pml_thickness)
+            loss, field_pred, residual, incident = _compute_loss(
+                data, model, device, mode, pml_thickness, object_weight, object_threshold)
 
             optimizer.zero_grad()
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1e-3)
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 0.3)
             optimizer.step()
 
             loss_train[epoch-1] += loss.item()
             count += 1
-            pbar.set_postfix(loss=loss.item())
+            pbar.set_postfix(loss=loss.item(), grad_norm=grad_norm.item())
 
             train_step = (epoch - 1) * n_batches + batch_idx
-            wandb.log({'train/loss_step': loss.item(), 'train_step': train_step})
+            wandb.log({'train/loss_step': loss.item(), 'train/grad_norm': grad_norm.item(), 'train_step': train_step})
 
             if batch_idx == 0:
                 log_field_pred = field_pred.detach().cpu()
@@ -254,7 +284,8 @@ def train(train_loader, model, optimizer, epoch, loss_train, device, mode, pml_t
         log_fields_to_wandb(log_field_pred, log_residual, log_incident, log_sample_ids, mode, 'train', epoch)
 
 
-def valid(valid_loader, model, epoch, loss_valid, device, mode, pml_thickness, log_freq):
+def valid(valid_loader, model, epoch, loss_valid, device, mode, pml_thickness, log_freq,
+          object_weight=1.0, object_threshold=1e-4):
     model.eval()
     log_field_pred = log_residual = log_incident = log_sample_ids = None
     with torch.set_grad_enabled(False):
@@ -262,7 +293,8 @@ def valid(valid_loader, model, epoch, loss_valid, device, mode, pml_thickness, l
 
         pbar = tqdm(valid_loader, desc=f"Epoch {epoch} [valid]", leave=False)
         for batch_idx, data in enumerate(pbar):
-            loss, field_pred, residual, incident = _compute_loss(data, model, device, mode, pml_thickness)
+            loss, field_pred, residual, incident = _compute_loss(
+                data, model, device, mode, pml_thickness, object_weight, object_threshold)
 
             loss_valid[epoch-1] += loss.item()
             count += 1
@@ -338,16 +370,25 @@ def field_grid_to_wandb(field, residual, incident, sample_ids, mode, train_valid
             continue
 
         Ey = field[i]
-        ax_real.imshow(Ey.real.numpy(), origin='lower', aspect='equal', vmin=FIELD_VMIN, vmax=FIELD_VMAX)
+        im_real = ax_real.imshow(Ey.real.numpy(), origin='lower', aspect='equal', vmin=FIELD_VMIN, vmax=FIELD_VMAX)
         ax_real.set_title(f'{sample_ids[i]}\nreal(E_y)', fontsize=8)
-        ax_imag.imshow(Ey.imag.numpy(), origin='lower', aspect='equal', vmin=FIELD_VMIN, vmax=FIELD_VMAX)
+        fig.colorbar(im_real, ax=ax_real)
+
+        im_imag = ax_imag.imshow(Ey.imag.numpy(), origin='lower', aspect='equal', vmin=FIELD_VMIN, vmax=FIELD_VMAX)
         ax_imag.set_title(f'{sample_ids[i]}\nimaginary(E_y)', fontsize=8)
-        ax_amp.imshow(Ey.abs().numpy(), origin='lower', aspect='equal', vmin=AMP_VMIN, vmax=AMP_VMAX)
+        fig.colorbar(im_imag, ax=ax_imag)
+
+        im_amp = ax_amp.imshow(Ey.abs().numpy(), origin='lower', aspect='equal', vmin=AMP_VMIN, vmax=AMP_VMAX)
         ax_amp.set_title(f'{sample_ids[i]}\namplitude(E_y)', fontsize=8)
-        ax_resid.imshow(residual[i].abs().pow(2).numpy(), origin='lower', aspect='equal')
+        fig.colorbar(im_amp, ax=ax_amp)
+
+        im_resid = ax_resid.imshow(residual[i].abs().pow(2).numpy(), origin='lower', aspect='equal')
         ax_resid.set_title(f'{sample_ids[i]}\n|residual|^2', fontsize=8)
-        ax_scat.imshow((Ey - incident[i]).abs().numpy(), origin='lower', aspect='equal', vmin=AMP_VMIN, vmax=AMP_VMAX)
+        fig.colorbar(im_resid, ax=ax_resid)
+
+        im_scat = ax_scat.imshow((Ey - incident[i]).abs().numpy(), origin='lower', aspect='equal')
         ax_scat.set_title(f'{sample_ids[i]}\namplitude(E_y - incident)', fontsize=8)
+        fig.colorbar(im_scat, ax=ax_scat)
 
     image = wandb.Image(fig)
     plt.close(fig)
@@ -409,6 +450,28 @@ if __name__ == '__main__':
         default=None,
         help="This should specify a filename of your checkpoint within 'directory'/model if you want to continue your training from the checkpoint.",
     )
+    arg_parser.add_argument(
+        "--reset_lr",
+        action="store_true",
+        help="When resuming from --load_ckpt, ignore the checkpoint's saved optimizer/scheduler state and restart the optimizer at the LearningRate in specs_maxwell.json, with the decay schedule restarting from the checkpoint's epoch.",
+    )
+    arg_parser.add_argument(
+        "--epochs",
+        type=int,
+        default=None,
+        help="Override Epochs from specs_maxwell.json.",
+    )
+    arg_parser.add_argument(
+        "--n_samples",
+        type=int,
+        default=None,
+        help="Limit training to this many unique samples (e.g. 1, for an overfitting sanity check). Overrides NumTrainSamples in specs_maxwell.json.",
+    )
+    arg_parser.add_argument(
+        "--skip_valid",
+        action="store_true",
+        help="Skip validation entirely, regardless of ValidFraction, for faster overfitting runs. Also honored via SkipValid in specs_maxwell.json.",
+    )
 
     args = arg_parser.parse_args()
-    main(args.load_ckpt)
+    main(args.load_ckpt, args.reset_lr, args.epochs, args.n_samples, args.skip_valid)

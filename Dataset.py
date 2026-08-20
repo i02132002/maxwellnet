@@ -42,12 +42,16 @@ class ShapeDataset(torch.utils.data.Dataset):
             ).select_columns(self._COLUMNS)
 
     @classmethod
-    def load_train_valid(cls, config, mode, valid_fraction=0.1, seed=0):
+    def load_train_valid(cls, config, mode, valid_fraction=0.1, seed=0, n_samples=None):
         """Load the HF dataset filtered to the polarization matching `mode`
         ('te' -> 's', 'tm' -> 'p'), then split into train/valid ShapeDatasets,
         grouped by `sample_id` so rows sharing a sample_id (e.g. its s/p-pol
         pair) always land in the same split — otherwise the same underlying
-        structure could leak across train and valid."""
+        structure could leak across train and valid.
+
+        `n_samples`, if given, caps the training split to the first
+        `n_samples` unique sample_ids (post-shuffle, pre-valid-split) --
+        e.g. for overfitting sanity checks on a handful of samples."""
         pol = 's' if mode == 'te' else 'p'
         full = load_dataset(
             "als-rixs/latent-image-training", config, split="train", revision="fixed-dimension",
@@ -58,9 +62,14 @@ class ShapeDataset(torch.utils.data.Dataset):
         random.Random(seed).shuffle(unique_ids)
         n_valid = round(len(unique_ids) * valid_fraction)
         valid_ids = set(unique_ids[:n_valid])
+        train_ids = unique_ids[n_valid:]
+        if n_samples is not None:
+            train_ids = train_ids[:n_samples]
+        train_ids = set(train_ids)
 
         is_valid = np.fromiter((sid in valid_ids for sid in sample_ids), dtype=bool)
-        train_indices = np.flatnonzero(~is_valid).tolist()
+        is_train = np.fromiter((sid in train_ids for sid in sample_ids), dtype=bool)
+        train_indices = np.flatnonzero(is_train).tolist()
         valid_indices = np.flatnonzero(is_valid).tolist()
         return cls(hf_dataset=full.select(train_indices)), cls(hf_dataset=full.select(valid_indices))
 

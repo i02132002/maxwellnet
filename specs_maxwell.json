@@ -13,21 +13,25 @@
   },
   "PhysicalSpecs": {
     "mode": "te",
-    "pml_thickness": 8
+    "pml_thickness": 10
   },
   "HFConfig": null,
+  "ObjectWeight": 1.0,
+  "ObjectThreshold": 1e-4,
   "ValidFraction": 0.1,
+  "NumTrainSamples": 1,
+  "SkipValid": true,
   "Seed": 2,
-  "LearningRate": 0.0005,
+  "LearningRate": 0.005,
   "LearningRateDecay": 0.5,
-  "LearningRateDecayStep": 50,
-  "Epochs": 100,
+  "LearningRateDecayStep": 5000,
+  "Epochs": 10000,
   "BatchSize": 16,
-  "SnapshotFrequency": 3,
+  "SnapshotFrequency": 1000,
   "WandB": {
     "Project": "maxwellnet",
     "Entity": "als-rixs",
     "Mode": "online",
-    "LogFrequency": 1
+    "LogFrequency": 100
   }
 }

@@ -44,14 +44,37 @@ def _pml_stretch_1d(n: int, delta: float, pml_thickness: int, pml_order: float =
     sample spacing `delta`. The interior (more than `pml_thickness` samples
     from either edge) is exactly 1 (no effect); each edge grades smoothly to
     an absorbing profile over the outer `pml_thickness` samples.
+
+    The polynomial is built from d/d_pml — the distance into the PML band
+    divided by the PML's own physical width (pml_thickness * delta) — not
+    the absolute distance `d` to the `pml_order` power. That ratio is
+    dimensionless by construction, so `pml_strength` (sigma_max, the
+    stretching factor exactly at the outer edge) is a portable, unitless
+    number regardless of what length unit `delta` happens to be in.
+    Building it from absolute `d` instead (MaxwellNet's own `rz_inverse`
+    does this, in micrometers) makes the constant implicitly carry units of
+    [length]^-pml_order: reusing pml_strength=5 with `delta` in angstroms
+    (this module) rather than micrometers overshoots by (1e4)**4 = 1e16,
+    since 1 um = 1e4 angstrom — the profile then jumps from ~1 to
+    ~1 + 3125i within the first few angstroms of the PML rather than
+    grading smoothly across its full width.
+
+    Args:
+        n: axis length in samples.
+        delta: physical sample spacing (same length unit as pml_thickness*delta).
+        pml_thickness: PML width, in samples, at each edge.
+        pml_order: grading polynomial order (MaxwellNet default: 4).
+        pml_strength: dimensionless stretching factor at the outer edge
+            (sigma_max; MaxwellNet default: 5).
     """
     idx = torch.arange(n, device=device, dtype=torch.float32) - (n - 1) / 2.0
     z = idx * delta
+    d_pml = pml_thickness * delta
 
-    r_p = 1 + 1j * pml_strength * (z - z[-1] + pml_thickness * delta) ** pml_order
+    r_p = 1 + 1j * pml_strength * ((z - z[-1] + d_pml) / d_pml) ** pml_order
     r_p[: n - pml_thickness] = 0
 
-    r_n = 1 + 1j * pml_strength * (z - z[0] - pml_thickness * delta) ** pml_order
+    r_n = 1 + 1j * pml_strength * ((z - z[0] - d_pml) / d_pml) ** pml_order
     r_n[pml_thickness:] = 0
 
     r = r_p + r_n
@@ -189,13 +212,13 @@ def helmholtz_residual_loss_periodic_pml(
         epsilon_map: Tensor,
         incident: Tensor,
         kz,
+        kx,
         mode: str,
         wavelength_a: float,
         delta_x_a: float,
         delta_z_a: float,
         pml_thickness: int,
         pml_order: float = 4.0,
-        pml_strength: float = 5.0,
 ) -> Tensor:
     """
     Helmholtz residual with a periodic (circular) boundary along x and a
@@ -204,20 +227,31 @@ def helmholtz_residual_loss_periodic_pml(
     `rz_inverse`/`dd_z_pml`, generalized to an arbitrary physical z-spacing
     and domain length (see `_pml_stretch_1d`).
 
-    Unlike `helmholtz_residual_loss`, nothing is trimmed: the x second
-    derivative wraps around (periodic, exact — no absorption needed). The z
-    second derivative is evaluated on the *scattered* field
+    Unlike `helmholtz_residual_loss`, nothing is trimmed. The x second
+    derivative wraps around with a Bloch/Floquet phase correction
+    (exp(∓i*kx*Lx), Lx = domain width) rather than plain repetition: the
+    field is only periodic *up to this phase factor* (E(x+Lx) = E(x)*e^{i kx
+    Lx}) unless kx*Lx happens to be an integer multiple of 2*pi, which is
+    generically false for an arbitrary oblique incidence angle. Plain
+    circular wraparound silently assumes phase = 1 and introduces a large,
+    spurious error with no real physical meaning (verified: >100% relative
+    error against the true incident wave's own analytic curvature, for a
+    generic non-commensurate angle) — this affects both `'s'` and `'p'`
+    mode's periodic-x derivatives, not just a PML-boundary-region artifact.
+
+    The z second derivative is evaluated on the *scattered* field
     (E_field - incident), zero-padded at each z-edge before PML grading —
     mirroring MaxwellNet's total-field/scattered-field split (`ey_s`,
-    `padding_zero`) — with the incident wave's own (un-stretched, exact)
-    z-curvature `-kz**2 * incident` added back in. This anchors the total
-    field to the known incident wave at the z-truncation boundary: without
-    it (i.e. differencing E_field directly with replicate padding, the prior
-    behavior of this function), the bare residual is exactly zero for the
-    trivial E_field ≡ 0 solution regardless of epsilon_map, and training can
-    collapse the predicted field to near-zero amplitude while still driving
-    this loss to ~0. The returned residual therefore covers the full input
-    domain.
+    `padding_zero`) — with the incident wave's own z-curvature (computed
+    with the same un-stretched finite-difference stencil, not the analytic
+    -kz**2*incident — see `_lap_z_pml_scattered`) added back in. This
+    anchors the total field to the known incident wave at the z-truncation
+    boundary: without it (i.e. differencing E_field directly with replicate
+    padding, the prior behavior of this function), the bare residual is
+    exactly zero for the trivial E_field ≡ 0 solution regardless of
+    epsilon_map, and training can collapse the predicted field to near-zero
+    amplitude while still driving this loss to ~0. The returned residual
+    therefore covers the full input domain.
 
     Args:
         E_field, epsilon_map, mode, wavelength_a, delta_x_a, delta_z_a: same
@@ -226,8 +260,8 @@ def helmholtz_residual_loss_periodic_pml(
         incident: incident plane wave e^(i k·r), same shape convention as
             E_field but without the p-pol component axis — (Nz, Nx) or
             (batch, Nz, Nx) — as returned by `ShapeNet.forward`.
-        kz: incident wave's z-wavevector component, scalar or (batch,), as
-            returned by `ShapeNet.forward`.
+        kz, kx: incident wave's z- and x-wavevector components, scalar or
+            (batch,), as returned by `ShapeNet.forward`.
         pml_thickness: number of grid samples, at each z-edge, over which the
             PML grades from transparent (interior) to absorbing.
         pml_order, pml_strength: PML grading polynomial order and absorption
@@ -239,28 +273,53 @@ def helmholtz_residual_loss_periodic_pml(
 
     Note: the p-pol path mirrors MaxwellNet's `dd_zx_pml`/`dd_xz_pml`
     cross-derivative treatment (single PML stretch factor at the z-derivative
-    stage of each mixed term, x left unstretched since it's periodic), but is
-    not covered by the (s-pol only) test data used to validate this module.
-    The cross-derivative terms (`_d_x_d_z_pml`, `_d_z_d_x_pml`) still
-    replicate-pad the total field and are not anchored to the incident wave
-    the way the main z-Laplacian terms now are.
+    stage of each mixed term, x Bloch-periodic since it's periodic-up-to-a-
+    phase), but is not covered by the (s-pol only) test data used to
+    validate this module.
     """
     k = 2 * math.pi / wavelength_a
     dx = delta_x_a
     dz = delta_z_a
 
+    pml_strength = 25.3125 / pml_thickness**4
+
     def _pad_z(f: Tensor, n: int) -> Tensor:
         return F.pad(f, (0, 0, n, n), mode='replicate')
 
-    def _pad_x(f: Tensor, n: int) -> Tensor:
-        return F.pad(f, (n, n, 0, 0), mode='circular')
+    def _bloch_pad_x(f: Tensor, n: int, kx_) -> Tensor:
+        """Pad n columns on each side along x with a Bloch/Floquet phase
+        correction (exp(∓i*kx*Lx), Lx = f's own x-extent) instead of plain
+        repetition — the field is periodic only up to this phase factor
+        unless kx*Lx happens to be an integer multiple of 2*pi, which is
+        generically false for an oblique incidence angle."""
+        Lx = f.shape[-1] * dx
+        kx_t = torch.as_tensor(kx_, dtype=torch.float32, device=f.device)
+        if kx_t.dim() > 0:
+            kx_t = kx_t.reshape(-1, 1, 1, 1)
+        angle = kx_t * Lx
+        phase = torch.complex(torch.cos(angle), torch.sin(angle)).to(f.dtype)
+        left = f[..., -n:] * torch.conj(phase)
+        right = f[..., :n] * phase
+        return torch.cat([left, f, right], dim=-1)
 
     def _lap_z_pml_scattered(f: Tensor, inc: Tensor, kz_) -> Tensor:
         """∂²f/∂z² with PML absorption, computed on the scattered field
         (f - inc) with a hard zero boundary (instead of replicating f
-        itself), plus the incident wave's exact un-stretched z-curvature
-        (-kz²·inc) added back — anchoring f to the known incident wave at
-        the z-truncation boundary. Output z-length == f's z-length."""
+        itself), plus the incident wave's own z-curvature added back —
+        anchoring f to the known incident wave at the z-truncation boundary.
+
+        The incident-curvature correction is computed with the *same*
+        (un-stretched) finite-difference stencil used on the scattered
+        field, not the analytic -kz**2*inc — by linearity of the stencil,
+        [stencil(scattered)] + [stencil(incident)] == [stencil(total field)]
+        exactly, whatever the stencil's own numerical-dispersion error is.
+        Using the exact analytic value instead would mix a dispersion-free
+        term with a dispersion-imperfect one, creating a spurious residual
+        (unrelated to any real scatterer) the network would have to spend
+        capacity compensating for — mirroring MaxwellNet's `dd_z_fast`,
+        which is likewise a finite difference of the precomputed incident
+        field rather than an analytic expression. Output z-length == f's
+        z-length."""
         scattered = f - inc
         padded = F.pad(scattered, (0, 0, 2, 2), mode='constant', value=0)
         rz_inv = _pml_stretch_1d(padded.shape[-2], dz, pml_thickness, pml_order,
@@ -270,30 +329,46 @@ def helmholtz_residual_loss_periodic_pml(
         h = F.conv2d(e, _kernel_h_z(dz, f.device), padding=0)
         h = h * rz_inv[2:-2].reshape(1, 1, -1, 1)
 
+        # Extend `inc` by 2 exact ghost rows on each z-edge via its own
+        # closed-form phase advance (exp(i*kz*dz) per step) rather than
+        # replicate-padding, then difference it with the same stencil, no
+        # PML stretching (matching dd_z_fast, which isn't PML-stretched
+        # either — the incident wave isn't what the PML is meant to absorb).
         kz_t = torch.as_tensor(kz_, dtype=torch.float32, device=f.device)
         if kz_t.dim() > 0:
             kz_t = kz_t.reshape(-1, 1, 1, 1)
-        return h - (kz_t ** 2) * inc
+        angle = kz_t * dz
+        step = torch.complex(torch.cos(angle), torch.sin(angle)).to(inc.dtype)
+        below2 = inc[..., :1, :] * torch.conj(step) ** 2
+        below1 = inc[..., :1, :] * torch.conj(step)
+        above1 = inc[..., -1:, :] * step
+        above2 = inc[..., -1:, :] * step ** 2
+        inc_padded = torch.cat([below2, below1, inc, above1, above2], dim=-2)
+        e_inc = F.conv2d(inc_padded, _kernel_e_z(dz, f.device), padding=0)
+        correction = F.conv2d(e_inc, _kernel_h_z(dz, f.device), padding=0)
 
-    def _lap_x_periodic(f: Tensor) -> Tensor:
-        """∂²f/∂x² with periodic wraparound, output x-length == f's x-length."""
-        padded = _pad_x(f, 2)
+        return h + correction
+
+    def _lap_x_periodic(f: Tensor, kx_) -> Tensor:
+        """∂²f/∂x² with Bloch-periodic wraparound, output x-length == f's
+        x-length."""
+        padded = _bloch_pad_x(f, 2, kx_)
         e = F.conv2d(padded, _kernel_e_x(dx, f.device), padding=0)
         h = F.conv2d(e, _kernel_h_x(dx, f.device), padding=0)
         return h
 
-    def _d_x_d_z_pml(f: Tensor) -> Tensor:
+    def _d_x_d_z_pml(f: Tensor, kx_) -> Tensor:
         """∂²f/∂x∂z = d_h_x( pml_z(d_e_z(f)) ), output shape == f's shape."""
-        padded = F.pad(_pad_z(f, 1), (1, 1, 0, 0), mode='circular')
+        padded = _bloch_pad_x(_pad_z(f, 1), 1, kx_)
         rz_inv = _pml_stretch_1d(padded.shape[-2], dz, pml_thickness, pml_order,
                                  pml_strength, device=f.device)
         e = F.conv2d(padded, _kernel_e_z(dz, f.device), padding=0)
         e = e * rz_inv[1:-1].reshape(1, 1, -1, 1)
         return F.conv2d(e, _kernel_h_x(dx, f.device), padding=0)
 
-    def _d_z_d_x_pml(f: Tensor) -> Tensor:
+    def _d_z_d_x_pml(f: Tensor, kx_) -> Tensor:
         """∂²f/∂z∂x = pml_z( d_h_z(d_e_x(f)) ), output shape == f's shape."""
-        padded = F.pad(_pad_z(f, 1), (1, 1, 0, 0), mode='circular')
+        padded = _bloch_pad_x(_pad_z(f, 1), 1, kx_)
         rz_inv = _pml_stretch_1d(padded.shape[-2], dz, pml_thickness, pml_order,
                                  pml_strength, device=f.device)
         e = F.conv2d(padded, _kernel_e_x(dx, f.device), padding=0)
@@ -305,7 +380,7 @@ def helmholtz_residual_loss_periodic_pml(
         eps = _ensure_4d(epsilon_map.to(torch.complex64))
         inc = _ensure_4d(incident.to(torch.complex64))
 
-        diff = _lap_z_pml_scattered(Ey, inc, kz) + _lap_x_periodic(Ey) + k**2 * eps * Ey
+        diff = _lap_z_pml_scattered(Ey, inc, kz) + _lap_x_periodic(Ey, kx) + k**2 * eps * Ey
         return diff.squeeze()
 
     elif mode == 'p':
@@ -327,8 +402,8 @@ def helmholtz_residual_loss_periodic_pml(
         eps_x = _ensure_4d(eps_x_raw.to(torch.complex64))
         inc   = _ensure_4d(incident.to(torch.complex64))
 
-        diff_z = (_lap_x_periodic(Ez) - _d_x_d_z_pml(Ex) + k**2 * eps_z * Ez).squeeze(1)
-        diff_x = (_lap_z_pml_scattered(Ex, inc, kz) - _d_z_d_x_pml(Ez) + k**2 * eps_x * Ex).squeeze(1)
+        diff_z = (_lap_x_periodic(Ez, kx) - _d_x_d_z_pml(Ex, kx) + k**2 * eps_z * Ez).squeeze(1)
+        diff_x = (_lap_z_pml_scattered(Ex, inc, kz) - _d_z_d_x_pml(Ez, kx) + k**2 * eps_x * Ex).squeeze(1)
 
         if is_batched:
             return torch.stack([diff_z, diff_x], dim=1)  # (B, 2, Nz, Nx)

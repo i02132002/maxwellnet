@@ -154,7 +154,7 @@ class MaxwellNet(nn.Module):
                 [1], dtype=torch.float32).to(ri_value.device))
 
             x = self.model(scat_pot)
-            total = torch.cat((x[:, 0:1, :, :] + 1, x[:, 1:2, :, :]), 1)
+            total = torch.cat((x[:, 0:1, :, :] + 1, x[:, 1:2, :, :]), 1) # The output is (B,C,W,H), where C=2 for the real and complex channels
 
             ey = self.complex_multiplication(total[:, 0:2, :, :],
                                              self.fast[:, :, self.pad:-self.pad:, self.pad:-self.pad:])

@@ -118,7 +118,7 @@ class PeriodicMaxwellNet(nn.Module):
             delta_x_a, delta_z_a: (B,) grid spacing in angstroms.
 
         Returns:
-            (field_pred, epsilon_map, incident, kz):
+            (field_pred, epsilon_map, incident, kz, kx):
                 field_pred: predicted total complex field, (B, Nz, Nx) for
                     'te' (Ey), or (B, 2, Nz, Nx) for 'tm' ([Ez, Ex]).
                 epsilon_map: matching epsilon (optical_constant**2), same
@@ -127,9 +127,10 @@ class PeriodicMaxwellNet(nn.Module):
                 incident: incident plane wave e^(i k·r), (B, Nz, Nx) complex64
                     — same for every field_pred channel, useful for isolating
                     the scattered field (field_pred - incident).
-                kz: incident wave's z-component of the wavevector, (B,) —
-                    needed alongside `incident` to anchor the z-PML residual
-                    to the known incident field (see `helmholtz_checker`).
+                kz, kx: incident wave's z- and x-components of the
+                    wavevector, (B,) each — needed alongside `incident` to
+                    anchor the z-PML residual and Bloch-correct the periodic
+                    x residual (see `helmholtz_checker`).
         """
         eps = self._select_epsilon(optical_constant.to(torch.complex64))  # (B, k, Nz, Nx)
         k = eps.shape[1]
@@ -161,4 +162,4 @@ class PeriodicMaxwellNet(nn.Module):
             field = field[:, 0]
             eps = eps[:, 0]
 
-        return field, eps, incident, kz
+        return field, eps, incident, kz, kx
