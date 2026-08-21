@@ -49,9 +49,14 @@ class ShapeDataset(torch.utils.data.Dataset):
         pair) always land in the same split — otherwise the same underlying
         structure could leak across train and valid.
 
-        `n_samples`, if given, caps the training split to the first
-        `n_samples` unique sample_ids (post-shuffle, pre-valid-split) --
-        e.g. for overfitting sanity checks on a handful of samples."""
+        `n_samples`, if given, caps the training split to its first
+        `n_samples` rows (in the dataset's natural order, after excluding
+        the valid split) -- e.g. for overfitting sanity checks on a handful
+        of samples. Note this counts *rows*, not unique sample_ids: a
+        sample_id can have multiple rows at this pol (e.g. several incidence
+        angles), so `n_samples=1` takes just the row that happens to come
+        first for whichever sample_id is first, not necessarily "one full
+        sample_id worth" of rows."""
         pol = 's' if mode == 'te' else 'p'
         full = load_dataset(
             "als-rixs/latent-image-training", config, split="train", revision="fixed-dimension",
@@ -62,15 +67,14 @@ class ShapeDataset(torch.utils.data.Dataset):
         random.Random(seed).shuffle(unique_ids)
         n_valid = round(len(unique_ids) * valid_fraction)
         valid_ids = set(unique_ids[:n_valid])
-        train_ids = unique_ids[n_valid:]
-        if n_samples is not None:
-            train_ids = train_ids[:n_samples]
-        train_ids = set(train_ids)
+        train_ids = set(unique_ids[n_valid:])
 
         is_valid = np.fromiter((sid in valid_ids for sid in sample_ids), dtype=bool)
         is_train = np.fromiter((sid in train_ids for sid in sample_ids), dtype=bool)
         train_indices = np.flatnonzero(is_train).tolist()
         valid_indices = np.flatnonzero(is_valid).tolist()
+        if n_samples is not None:
+            train_indices = train_indices[:n_samples]
         return cls(hf_dataset=full.select(train_indices)), cls(hf_dataset=full.select(valid_indices))
 
     def __len__(self):
@@ -82,17 +86,39 @@ class ShapeDataset(torch.utils.data.Dataset):
         optical_constant = (np.asarray(r["optical_constant_real"])
                             + 1j * np.asarray(r["optical_constant_imag"]))
         # Crop off the last row/column (e.g. 257x257 -> 256x256) so the grid
-        # size is a clean power of two -- both ShapeNet (UNet pooling) and
-        # helmholtz_checker (periodic-x/PML-z residual) consume this same
-        # cropped array, so they see a consistent grid.
+        # size is a clean power of two for the UNet's pooling.
         optical_constant = optical_constant[:-1, :-1, :]
+
+        # optical_constant's last dim is 3 components ordered [Ez, Ex, Ey];
+        # 's' (te) only needs Ey (index 2). 'p' (tm) would need both Ez, Ex,
+        # which MaxwellNet.forward's single scat_pot/ri_value pair doesn't
+        # support -- only 's'/'te' is exercised below.
+        pol_index = 2 if r["pol"] == 's' else 0
+        n_map = optical_constant[..., pol_index]
+
+        #n_map = 1.0 + 10.0 * np.abs(n_map - 1.0)
+
+        # MaxwellNet's tensor convention has dim-2 ("Nx") as the axis its
+        # x-difference operators act on and dim-1 ("Nz") as the one its
+        # incident wave propagates along (see the gradient_h_x/gradient_h_z
+        # kernel shapes in MaxwellNet.py) -- the transpose of this array's
+        # (row=z, col=x) layout, so transpose to match.
+        n_map = n_map.T
+
+        # MaxwellNet.forward reconstructs epsilon as scat_pot * ri_value**2
+        # (then clips to a floor of 1) -- ri_value is the map's peak
+        # refractive index, and scat_pot the (0-1) fraction of that peak
+        # each pixel represents, so this exactly reproduces n_map.
+        ri_value = float(n_map.max())
+        scat_pot = (n_map / ri_value) ** 2
 
         delta_x_a = 1.0
         delta_z_a = 1.0
 
         return {
             "sample_id": r["sample_id"],
-            "optical_constant": torch.from_numpy(optical_constant),
+            "scat_pot": torch.from_numpy(scat_pot.astype(np.float32)).unsqueeze(0),
+            "ri_value": ri_value,
             "wavelength_nm": r["wavelength_nm"],
             "x0_A": r["x0_A"],
             "y0_A": r["y0_A"],
