@@ -10,7 +10,8 @@ import numpy as np
 
 class MaxwellNet(nn.Module):
     def __init__(self, depth=6, filter=16, norm='weight', up_mode='upconv',
-                 wavelength=1, dpl=20, Nx=256, Nz=256, pml_thickness=16, symmetry_x=False, mode='te', high_order='fourth'):
+                 wavelength=1, dpl=20, Nx=256, Nz=256, pml_thickness=16, symmetry_x=False, mode='te', high_order='fourth',
+                 kx=0.0):
 
         super(MaxwellNet, self).__init__()
         self.mode = mode
@@ -74,19 +75,18 @@ class MaxwellNet(nn.Module):
         self.fast_z[0, 0, :, :] = torch.from_numpy(np.real(fast_z))
         self.fast_z[0, 1, :, :] = torch.from_numpy(np.imag(fast_z))
 
-        # perfectly-matched-layer set up
+        # x is Bloch/Floquet-periodic (E(x+Lx) = E(x)*e^{i*kx*Lx}) rather
+        # than PML-absorbing -- only z gets a perfectly-matched layer.
+        self.kx = kx
+        Lx = Nx * delta
+        self.register_buffer('bloch_phase', torch.zeros(
+            (1, 2, 1, 1), dtype=torch.float32, requires_grad=False))
+        self.bloch_phase[0, 0, 0, 0] = math.cos(kx * Lx)
+        self.bloch_phase[0, 1, 0, 0] = math.sin(kx * Lx)
+
+        # perfectly-matched-layer set up (z only)
         m = 4
         const = 5
-        rx_p = 1 + 1j * const * (xx - x[-1] + pml_thickness * delta) ** m
-        rx_p[0:-pml_thickness, :] = 0
-        rx_n = 1 + 1j * const * (xx - x[0] - pml_thickness * delta) ** m
-        rx_n[pml_thickness::, :] = 0
-        rx = rx_p + rx_n
-        if symmetry_x == True:
-            rx[0:-pml_thickness:, :] = 1
-        else:
-            rx[pml_thickness:-pml_thickness, :] = 1
-
         rz_p = 1 + 1j * const * (zz - z[-1] + pml_thickness * delta) ** m
         rz_p[:, 0:-pml_thickness] = 0
         rz_n = 1 + 1j * const * (zz - z[0] - pml_thickness * delta) ** m
@@ -94,13 +94,7 @@ class MaxwellNet(nn.Module):
         rz = rz_p + rz_n
         rz[:, pml_thickness:-pml_thickness] = 1
 
-        rx_inverse = 1 / rx
         rz_inverse = 1 / rz
-
-        self.register_buffer('rx_inverse', torch.zeros((1, 2, rx_inverse.shape[0], rx_inverse.shape[1]), dtype=torch.float32,
-                                                       requires_grad=False))
-        self.rx_inverse[0, 0, :, :] = torch.from_numpy(np.real(rx_inverse))
-        self.rx_inverse[0, 1, :, :] = torch.from_numpy(np.imag(rx_inverse))
 
         self.register_buffer('rz_inverse', torch.zeros((1, 2, rz_inverse.shape[0], rz_inverse.shape[1]), dtype=torch.float32,
                                                        requires_grad=False))
@@ -167,13 +161,13 @@ class MaxwellNet(nn.Module):
                 ey_s = self.padding_zero(ey_s)
 
             if self.high_order == 'second':
-                diff = self.dd_x_pml(ey_s)[:, :, :, self.pad:-self.pad] \
+                diff = self.dd_x_periodic(ey) \
                     + self.dd_z_pml(ey_s)[:, :, self.pad:-self.pad, :] \
                     + self.dd_z_fast \
                     + self.k ** 2 * (epsillon * ey)
 
             elif self.high_order == 'fourth':
-                diff = self.dd_x_ho_pml(ey_s)[:, :, :, self.pad:-self.pad] \
+                diff = self.dd_x_ho_periodic(ey) \
                     + self.dd_z_ho_pml(ey_s)[:, :, self.pad:-self.pad, :] \
                     + self.dd_z_ho_fast \
                     + self.k ** 2 * (epsillon * ey)
@@ -196,6 +190,7 @@ class MaxwellNet(nn.Module):
 
             ez_s = self.complex_multiplication(
                 total[:, 2:4, :, :], self.fast_z[:, :, self.pad:-self.pad:, self.pad:-self.pad:])
+            ez_unpadded = ez_s  # keep a handle before padding_ref/padding_zero overwrites ez_s below
 
             if self.symmetry_x == True:
                 ex_s = self.padding_zero(ex_s)
@@ -213,21 +208,24 @@ class MaxwellNet(nn.Module):
                     - self.dd_zx(ez_s)[:, :, self.pad // 2:-self.pad // 2:, self.pad // 2:-self.pad // 2] \
                     + self.k ** 2 * (epsillon_x * ex) \
 
-                diff_z = self.dd_x_pml(ez_s)[:, :, :, self.pad:-self.pad] \
+                diff_z = self.dd_x_periodic(ez_unpadded) \
                     - self.dd_xz(ex_s)[:, :, self.pad // 2:-self.pad // 2:, self.pad // 2:-self.pad // 2] \
                     + self.k ** 2 * (epsillon_z * ez_s) \
 
             elif self.high_order == 'fourth':
-                diff_x = self.dd_z_ho_pml(ex_s)[:, :, self.pad:-self.pad:, :] \
-                    + self.dd_z_ho_fast \
-                    - self.dd_zx_ho_pml(ez_s)[:, :, self.pad//2:-self.pad//2:, self.pad//2:-self.pad//2] \
-                    + self.k ** 2 * (epsillon_x * ex)
-
-                diff_z = self.dd_x_ho_pml(ez_s)[:, :, :, self.pad:-self.pad] \
-                    - self.dd_xz_ho_pml(ex_s)[:, :, self.pad//2:-self.pad//2:, self.pad//2:-self.pad//2] \
-                    + self.k ** 2 * \
-                    (epsillon_z * ez_s[:, :, self.pad:-
-                     self.pad:, self.pad:-self.pad:])
+                # dd_zx_ho_pml/dd_xz_ho_pml (the mixed x/z derivatives tm's
+                # fourth-order path needs) combined the z-PML stretch with
+                # an x-PML stretch that no longer exists now that x is
+                # Bloch-periodic -- porting that mixed derivative to a
+                # periodic-x/PML-z combination hasn't been done (and 'tm'
+                # was already unsupported by Dataset.py's scat_pot/ri_value
+                # adapter), so fail loudly rather than silently reuse the
+                # now-nonexistent PML-x treatment.
+                raise NotImplementedError(
+                    "mode='tm' with high_order='fourth' needs a periodic-x/PML-z mixed "
+                    "derivative (dd_zx_ho_periodic/dd_xz_ho_periodic) that hasn't been "
+                    "implemented; use high_order='second' (mode='tm') or mode='te'."
+                )
 
             diff = torch.cat((diff_x, diff_z), 1)
 
@@ -241,7 +239,13 @@ class MaxwellNet(nn.Module):
         return torch.cat((r_p, i_p), 1)
 
     def complex_conjugate(self, a):
-        return torch.cat((-a[:, 1:2, :, :], a[:, 0:1, :, :]), 1)
+        # NOTE: previously returned cat((-a[:,1:2], a[:,0:1]), 1), which is
+        # actually i*a (a 90-degree rotation), not conj(a) = (re, -im) --
+        # this method was defined but never called in master's own forward
+        # pass, so that bug was never exercised. Fixed here since
+        # _bloch_pad_x (below) is now a real caller that needs the actual
+        # conjugate.
+        return torch.cat((a[:, 0:1, :, :], -a[:, 1:2, :, :]), 1)
 
     def d_e_x(self, x):
         return F.conv2d(x, self.gradient_e_x, padding=0, groups=2)
@@ -273,13 +277,31 @@ class MaxwellNet(nn.Module):
     def dd_x_ho(self, x):
         return self.d_h_x_ho(self.d_e_x_ho(x))
 
-    def dd_x_pml(self, x):
-        return self.complex_multiplication(self.rx_inverse[:, :, 2:-2, :], self.d_h_x(
-            self.complex_multiplication(self.rx_inverse[:, :, 1:-1, :], self.d_e_x(x))))
+    def _bloch_pad_x(self, x, n):
+        """Pad n rows on each side of dim-2 ('x') with a Bloch/Floquet phase
+        correction (exp(-i*kx*Lx) on the low side, exp(+i*kx*Lx) on the high
+        side) instead of PML-stretching -- x is periodic only up to this
+        phase factor (E(x+Lx) = E(x)*e^{i*kx*Lx}) unless kx*Lx happens to be
+        an integer multiple of 2*pi, which is generically false for an
+        oblique incidence angle."""
+        phase = self.bloch_phase
+        phase_conj = self.complex_conjugate(phase)
+        left = self.complex_multiplication(x[:, :, -n:, :], phase_conj)
+        right = self.complex_multiplication(x[:, :, :n, :], phase)
+        return torch.cat([left, x, right], dim=2)
 
-    def dd_x_ho_pml(self, x):
-        return self.complex_multiplication(self.rx_inverse[:, :, 4:-4, :], self.d_h_x_ho(
-            self.complex_multiplication(self.rx_inverse[:, :, 2:-2, :], self.d_e_x_ho(x))))
+    def dd_x_periodic(self, x):
+        """∂²/∂x² with Bloch-periodic wraparound, output dim-2 size == x's.
+        Two sequential 3-tap (K=3) convs each consume 2 (1/side), so the
+        Bloch pad must add self.pad(=2) on each side to land back at x's
+        original size."""
+        return self.d_h_x(self.d_e_x(self._bloch_pad_x(x, self.pad)))
+
+    def dd_x_ho_periodic(self, x):
+        """As dd_x_periodic, but with the 5-tap (K=5) fourth-order kernels,
+        each consuming 4 (2/side) -- self.pad(=4) per side again lands back
+        at x's original size."""
+        return self.d_h_x_ho(self.d_e_x_ho(self._bloch_pad_x(x, self.pad)))
 
     def dd_z(self, x):
         return self.d_h_z(self.d_e_z(x))
@@ -301,24 +323,8 @@ class MaxwellNet(nn.Module):
     def dd_zx_ho(self, x):
         return self.d_h_z_ho(self.d_e_x_ho(x))
 
-    def dd_zx_pml(self, x):
-        return self.complex_multiplication(self.rz_inverse[:, :, 1:-1, 1:-1], self.d_h_z(
-            self.complex_multiplication(self.rx_inverse[:, :, 1:-1, :], self.d_e_x(x))))
-
-    def dd_zx_ho_pml(self, x):
-        return self.complex_multiplication(self.rz_inverse[:, :, 2:-2, 2:-2], self.d_h_z_ho(
-            self.complex_multiplication(self.rx_inverse[:, :, 2:-2, :], self.d_e_x_ho(x))))
-
     def dd_xz(self, x):
         return self.d_h_x(self.d_e_z(x))
 
     def dd_xz_ho(self, x):
         return self.d_h_x_ho(self.d_e_z_ho(x))
-
-    def dd_xz_pml(self, x):
-        return self.complex_multiplication(self.rx_inverse[:, :, 1:-1, 1:-1], self.d_h_x(
-            self.complex_multiplication(self.rz_inverse[:, :, :, 1:-1], self.d_e_z(x))))
-
-    def dd_xz_ho_pml(self, x):
-        return self.complex_multiplication(self.rx_inverse[:, :, 2:-2, 2:-2], self.d_h_x_ho(
-            self.complex_multiplication(self.rz_inverse[:, :, :, 2:-2], self.d_e_z_ho(x))))
