@@ -18,6 +18,8 @@
   "HFConfig": null,
   "ValidFraction": 0.1,
   "NumTrainSamples": 1,
+  "SampleId": "sample_0000",
+  "SampleTheta": null,
   "SkipValid": true,
   "Seed": 2,
   "LearningRate": 0.0005,
