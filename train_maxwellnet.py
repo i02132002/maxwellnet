@@ -21,7 +21,7 @@ import json
 from datetime import datetime
 
 
-def main(load_ckpt, reset_lr=False, epochs_override=None, n_samples=None, skip_valid=False):
+def main(load_ckpt, reset_lr=False, epochs_override=None, n_samples=None, skip_valid=False, sample_id=None, theta=None):
     directory = "test_run1"
     logging.basicConfig(level=logging.DEBUG,
                         format='%(asctime)s %(filename)s[line:%(lineno)d] %(levelname)s %(message)s',
@@ -57,11 +57,6 @@ def main(load_ckpt, reset_lr=False, epochs_override=None, n_samples=None, skip_v
     physical_specs = specs["PhysicalSpecs"]
     mode = physical_specs['mode']
     pml_thickness = physical_specs['pml_thickness']
-    # A flat mean loss lets the (much larger, and trivially correct) eps=1
-    # background dominate training and drag the object region back towards
-    # matching the incident wave too -- upweight object pixels directly.
-    object_weight = get_spec_with_default(specs, "ObjectWeight", 20.0)
-    object_threshold = get_spec_with_default(specs, "ObjectThreshold", 1e-4)
 
     model = PeriodicMaxwellNet(**specs["NetworkSpecs"], mode=mode)
     if torch.cuda.device_count() > 1:
@@ -117,9 +112,12 @@ def main(load_ckpt, reset_lr=False, epochs_override=None, n_samples=None, skip_v
     hf_config = get_spec_with_default(specs, "HFConfig", None)
     valid_fraction = get_spec_with_default(specs, "ValidFraction", 0.1)
     n_samples = n_samples if n_samples is not None else get_spec_with_default(specs, "NumTrainSamples", None)
+    sample_id = sample_id if sample_id is not None else get_spec_with_default(specs, "SampleId", None)
+    theta = theta if theta is not None else get_spec_with_default(specs, "SampleTheta", None)
     skip_valid = skip_valid or get_spec_with_default(specs, "SkipValid", False)
     train_dataset, valid_dataset = ShapeDataset.load_train_valid(
-        hf_config, mode, valid_fraction, seed_number if seed_number is not None else 0, n_samples=n_samples)
+        hf_config, mode, valid_fraction, seed_number if seed_number is not None else 0,
+        n_samples=n_samples, sample_id=sample_id, theta=theta)
 
     # Fetching a sample means decoding an HF Arrow row (numpy conversion of
     # the optical_constant array), which is CPU-bound and otherwise
@@ -136,8 +134,12 @@ def main(load_ckpt, reset_lr=False, epochs_override=None, n_samples=None, skip_v
     if num_workers > 0:
         loader_kwargs.update(persistent_workers=True, prefetch_factor=4)
 
+    # Don't shuffle when deliberately targeting a small, fixed set of
+    # samples (a single row via n_samples, or every row for one sample_id)
+    # -- shuffling a handful of items adds nothing but non-determinism.
+    overfit_single = (n_samples == 1) or (sample_id is not None)
     train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size,
-                                               shuffle=(n_samples != 1), sampler=None, **train_loader_kwargs)
+                                               shuffle=(not overfit_single), sampler=None, **train_loader_kwargs)
     logging.info("Train Dataset length: {}".format(len(train_dataset)))
     loss_train = torch.zeros(
         (int(epochs),), dtype=torch.float32, requires_grad=False)
@@ -172,12 +174,12 @@ def main(load_ckpt, reset_lr=False, epochs_override=None, n_samples=None, skip_v
 
     for epoch in range(start_epoch + 1, epochs + 1):
         train(train_loader, model, optimizer, epoch, loss_train,
-              device, mode, pml_thickness, log_freq, object_weight, object_threshold)
+              device, mode, pml_thickness, log_freq)
         logging.info("[Train] {} epoch. Loss: {:.5f}".format(
             epoch, loss_train[epoch-1].item())) if rank == 0 else None
         if perform_valid:
             valid(valid_loader, model, epoch, loss_valid,
-                  device, mode, pml_thickness, log_freq, object_weight, object_threshold)
+                  device, mode, pml_thickness, log_freq)
             logging.info("[Valid] {} epoch. Loss: {:.5f}".format(
                 epoch, loss_valid[epoch-1].item())) if rank == 0 else None
 
@@ -214,18 +216,17 @@ def main(load_ckpt, reset_lr=False, epochs_override=None, n_samples=None, skip_v
     wandb.finish() if rank == 0 else None
 
 
-def _compute_loss(data, model, device, mode, pml_thickness,
-                  object_weight=1.0, object_threshold=1e-4):
+def _compute_loss(data, model, device, mode, pml_thickness):
     optical_constant = data['optical_constant'].to(torch.complex64).to(device)
     pol = data['pol'][0]
     # wavelength/grid spacing are the same across a batch (ShapeDataset
     # samples are drawn at fixed dimensions/resolution), so the first
     # sample's values apply to the whole batch.
-    wavelength_a = data['wavelength_nm'][0].item() * 10.0
-    delta_x_a = data['delta_x_a'][0].item()
-    delta_z_a = data['delta_z_a'][0].item()
+    wavelength_a_real = data['wavelength_nm'][0].item() * 10.0
+    delta_x_a_real = data['delta_x_a'][0].item()
+    delta_z_a_real = data['delta_z_a'][0].item()
 
-    field_pred, epsilon_map, incident, kz, kx = model(
+    envelope, epsilon_map, incident, kz, kx = model(
         optical_constant,
         data['theta'].to(torch.float32).to(device),
         data['wavelength_nm'].to(torch.float32).to(device),
@@ -233,31 +234,43 @@ def _compute_loss(data, model, device, mode, pml_thickness,
         data['delta_z_a'].to(torch.float32).to(device),
     )
 
+    # Re-express in units of the sample's own wavelength (wavelength=1,
+    # matching fl/replicate's/master's convention) instead of absolute
+    # Angstroms, so the residual/loss magnitude no longer depends on this
+    # dataset's arbitrary choice of Angstrom as the length unit -- k=2*pi
+    # is fixed regardless of the sample's real k0, and grid spacing becomes
+    # a fraction of one wavelength. This is a pure unit-system change, not
+    # a physics change: `incident` (built from the real kz/kx/delta) is
+    # left as-is, and kz/kx are rescaled by wavelength_a_real so that
+    # kz*dz and kx*Lx (the only ways they enter the residual, via the
+    # z-truncation phase-advance and the Bloch phase) come out identical
+    # to their real-unit values -- verified: kz_norm*dz_norm ==
+    # kz_real*wavelength_a_real * (dz_real/wavelength_a_real) ==
+    # kz_real*dz_real exactly, and likewise for kx*Lx.
+    wavelength_a = 1.0
+    delta_x_a = delta_x_a_real / wavelength_a_real
+    delta_z_a = delta_z_a_real / wavelength_a_real
+    kz = kz * wavelength_a_real
+    kx = kx * wavelength_a_real
+
     residual = helmholtz_residual_loss_periodic_pml(
-        field_pred, epsilon_map, incident, kz, kx, pol, wavelength_a, delta_x_a, delta_z_a, pml_thickness)
+        envelope, epsilon_map, incident, kz, kx, pol, wavelength_a, delta_x_a, delta_z_a, pml_thickness)
 
-    # A flat mean lets the (much larger, trivially-correct) eps=1 background
-    # dominate training and drag the object region back towards matching
-    # the incident wave too. Upweight object pixels directly.
-    is_object = (epsilon_map - 1.0).abs() > object_threshold
-    weight = torch.where(is_object, object_weight, 1.0)
-
-    loss = torch.mean(weight * residual.abs().pow(2))
-    return loss, field_pred, residual, incident
+    loss = torch.mean(residual.abs().pow(2))
+    return loss, envelope, residual, incident
 
 
-def train(train_loader, model, optimizer, epoch, loss_train, device, mode, pml_thickness, log_freq,
-          object_weight=1.0, object_threshold=1e-4):
+def train(train_loader, model, optimizer, epoch, loss_train, device, mode, pml_thickness, log_freq):
     model.train()
     n_batches = len(train_loader)
-    log_field_pred = log_residual = log_incident = log_sample_ids = None
+    log_envelope = log_residual = log_incident = log_sample_ids = log_theta = None
     with torch.set_grad_enabled(True):
         count = 0
 
         pbar = tqdm(train_loader, desc=f"Epoch {epoch} [train]", leave=False)
         for batch_idx, data in enumerate(pbar):
-            loss, field_pred, residual, incident = _compute_loss(
-                data, model, device, mode, pml_thickness, object_weight, object_threshold)
+            loss, envelope, residual, incident = _compute_loss(
+                data, model, device, mode, pml_thickness)
 
             optimizer.zero_grad()
             loss.backward()
@@ -272,149 +285,95 @@ def train(train_loader, model, optimizer, epoch, loss_train, device, mode, pml_t
             wandb.log({'train/loss_step': loss.item(), 'train/grad_norm': grad_norm.item(), 'train_step': train_step})
 
             if batch_idx == 0:
-                log_field_pred = field_pred.detach().cpu()
+                log_envelope = envelope.detach().cpu()
                 log_residual = residual.detach().cpu()
                 log_incident = incident.detach().cpu()
                 log_sample_ids = list(data['sample_id'])
+                log_theta = data['theta'].detach().cpu().tolist()
 
         loss_train[epoch-1] = loss_train[epoch-1] / count
 
     wandb.log({'train/loss': loss_train[epoch-1].item(), 'epoch': epoch})
     if log_freq and epoch % log_freq == 0:
-        log_fields_to_wandb(log_field_pred, log_residual, log_incident, log_sample_ids, mode, 'train', epoch)
+        log_fields_to_wandb(log_envelope, log_residual, log_incident, log_sample_ids, log_theta, mode, 'train', epoch)
 
 
-def valid(valid_loader, model, epoch, loss_valid, device, mode, pml_thickness, log_freq,
-          object_weight=1.0, object_threshold=1e-4):
+def valid(valid_loader, model, epoch, loss_valid, device, mode, pml_thickness, log_freq):
     model.eval()
-    log_field_pred = log_residual = log_incident = log_sample_ids = None
+    log_envelope = log_residual = log_incident = log_sample_ids = log_theta = None
     with torch.set_grad_enabled(False):
         count = 0
 
         pbar = tqdm(valid_loader, desc=f"Epoch {epoch} [valid]", leave=False)
         for batch_idx, data in enumerate(pbar):
-            loss, field_pred, residual, incident = _compute_loss(
-                data, model, device, mode, pml_thickness, object_weight, object_threshold)
+            loss, envelope, residual, incident = _compute_loss(
+                data, model, device, mode, pml_thickness)
 
             loss_valid[epoch-1] += loss.item()
             count += 1
             pbar.set_postfix(loss=loss.item())
 
             if batch_idx == 0:
-                log_field_pred = field_pred.detach().cpu()
+                log_envelope = envelope.detach().cpu()
                 log_residual = residual.detach().cpu()
                 log_incident = incident.detach().cpu()
                 log_sample_ids = list(data['sample_id'])
+                log_theta = data['theta'].detach().cpu().tolist()
 
         loss_valid[epoch-1] = loss_valid[epoch-1] / count
 
     wandb.log({'valid/loss': loss_valid[epoch-1].item(), 'epoch': epoch})
     if log_freq and epoch % log_freq == 0:
-        log_fields_to_wandb(log_field_pred, log_residual, log_incident, log_sample_ids, mode, 'valid', epoch)
+        log_fields_to_wandb(log_envelope, log_residual, log_incident, log_sample_ids, log_theta, mode, 'valid', epoch)
 
 
-# Fixed color scale for E-field plots, so brightness is comparable across
-# samples/epochs instead of each panel autoscaling to its own min/max. The
-# incident plane wave has unit amplitude (see ShapeNet._incident_wave), so
-# the total field's real/imaginary parts and amplitude are expected to stay
-# within a small multiple of that.
-FIELD_VMIN, FIELD_VMAX = -2.0, 2.0
-AMP_VMIN, AMP_VMAX = 0.0, 2.0
+# Cap how many samples in the logged batch get their own figure, so a
+# large (e.g. full-dataset) batch doesn't generate dozens of images per
+# log point -- deliberately-small batches (like "both angles of one
+# sample_id") are well under this and get one figure each.
+MAX_LOGGED_SAMPLES = 8
 
 
-def log_fields_to_wandb(field, residual, incident, sample_ids, mode, train_valid, epoch):
+def log_fields_to_wandb(envelope, residual, incident, sample_ids, theta, mode, train_valid, epoch):
+    """Plot real, imaginary, and amplitude of the predicted envelope; real
+    and amplitude of the reconstructed total field E_total = incident *
+    (1 + envelope); and the Helmholtz residual (|residual|^2) -- one
+    figure per sample in the batch (up to MAX_LOGGED_SAMPLES), labeled by
+    sample_id and incidence angle so e.g. the same sample_id at different
+    angles is distinguishable rather than only the first batch entry."""
+    n = min(len(sample_ids), MAX_LOGGED_SAMPLES)
     images = {}
+    for i in range(n):
+        label = f'{sample_ids[i]}_theta{theta[i]:.0f}'
+        if mode == 'te':
+            components = [('', envelope[i], residual[i], incident[i])]
+        else:
+            components = [('_z', envelope[i, 0], residual[i, 0], incident[i]),
+                          ('_x', envelope[i, 1], residual[i, 1], incident[i])]
 
-    if mode == 'te':
-        images.update(field_grid_to_wandb(field, residual, incident, sample_ids, mode, train_valid))
-    else:
-        single_field = field[0]
-        for label, f in zip(('z', 'x'), (single_field[0], single_field[1])):
-            for part_name, part, vmin, vmax in (
-                ('amplitude', f.abs(), AMP_VMIN, AMP_VMAX),
-                ('real', f.real, FIELD_VMIN, FIELD_VMAX),
-                ('imaginary', f.imag, FIELD_VMIN, FIELD_VMAX),
-            ):
-                normalized = (part - vmin) / (vmax - vmin)
-                normalized = torch.clamp(normalized, 0.0, 1.0)
-                normalized = torch.flip(normalized, dims=[0])  # wandb.Image draws row 0 at the top; flip to match the origin='lower' residual plots
-                images[f'{train_valid}/{mode}/{part_name}_{label}'] = wandb.Image(normalized.unsqueeze(0))
+        for suffix, a, r, inc in components:
+            e_total = (1.0 + a) * inc
 
-    images.update(plot_helmholtz_residual(residual[0], mode, train_valid))
+            fig, axes = plt.subplots(1, 6, figsize=(30, 4), constrained_layout=True)
+            for ax, part, title in zip(axes[:3], (a.real, a.imag, a.abs()), ('real', 'imaginary', 'amplitude')):
+                im = ax.imshow(part.numpy(), origin='lower', aspect='equal', cmap='magma')
+                ax.set_title(f'{label}\n{title}(envelope){suffix}', fontsize=9)
+                fig.colorbar(im, ax=ax)
+
+            for ax, part, title in zip(axes[3:5], (e_total.real, e_total.abs()), ('real', 'amplitude')):
+                im = ax.imshow(part.numpy(), origin='lower', aspect='equal', cmap='magma')
+                ax.set_title(f'{label}\n{title}(E_total){suffix}', fontsize=9)
+                fig.colorbar(im, ax=ax)
+
+            im = axes[5].imshow(r.abs().pow(2).numpy(), origin='lower', aspect='equal', cmap='magma')
+            axes[5].set_title(f'{label}\n|residual|^2{suffix}', fontsize=9)
+            fig.colorbar(im, ax=axes[5])
+
+            images[f'{train_valid}/{mode}/envelope_residual/{label}{suffix}'] = wandb.Image(fig)
+            plt.close(fig)
 
     images['epoch'] = epoch
     wandb.log(images)
-
-
-def field_grid_to_wandb(field, residual, incident, sample_ids, mode, train_valid, nrows=3, ncols=3):
-    """Plot an nrows x ncols grid of samples' Ey field, each cell showing
-    real(E_y), imaginary(E_y), amplitude(E_y), the Helmholtz residual
-    (|residual|^2), and amplitude(E_y - incident plane wave) — i.e. the
-    scattered field — side by side, titled with sample_id."""
-    n = min(nrows * ncols, field.shape[0], residual.shape[0], incident.shape[0], len(sample_ids))
-    fig, axes = plt.subplots(nrows, ncols * 5, figsize=(ncols * 11.0, nrows * 2.4),
-                             constrained_layout=True)
-    axes = np.atleast_2d(axes)
-
-    for i in range(nrows * ncols):
-        row, col = divmod(i, ncols)
-        ax_real, ax_imag, ax_amp, ax_resid, ax_scat = (
-            axes[row, col * 5], axes[row, col * 5 + 1], axes[row, col * 5 + 2],
-            axes[row, col * 5 + 3], axes[row, col * 5 + 4])
-        ax_real.axis('off')
-        ax_imag.axis('off')
-        ax_amp.axis('off')
-        ax_resid.axis('off')
-        ax_scat.axis('off')
-        if i >= n:
-            continue
-
-        Ey = field[i]
-        im_real = ax_real.imshow(Ey.real.numpy(), origin='lower', aspect='equal', vmin=FIELD_VMIN, vmax=FIELD_VMAX)
-        ax_real.set_title(f'{sample_ids[i]}\nreal(E_y)', fontsize=8)
-        fig.colorbar(im_real, ax=ax_real)
-
-        im_imag = ax_imag.imshow(Ey.imag.numpy(), origin='lower', aspect='equal', vmin=FIELD_VMIN, vmax=FIELD_VMAX)
-        ax_imag.set_title(f'{sample_ids[i]}\nimaginary(E_y)', fontsize=8)
-        fig.colorbar(im_imag, ax=ax_imag)
-
-        im_amp = ax_amp.imshow(Ey.abs().numpy(), origin='lower', aspect='equal', vmin=AMP_VMIN, vmax=AMP_VMAX)
-        ax_amp.set_title(f'{sample_ids[i]}\namplitude(E_y)', fontsize=8)
-        fig.colorbar(im_amp, ax=ax_amp)
-
-        im_resid = ax_resid.imshow(residual[i].abs().pow(2).numpy(), origin='lower', aspect='equal')
-        ax_resid.set_title(f'{sample_ids[i]}\n|residual|^2', fontsize=8)
-        fig.colorbar(im_resid, ax=ax_resid)
-
-        im_scat = ax_scat.imshow((Ey - incident[i]).abs().numpy(), origin='lower', aspect='equal')
-        ax_scat.set_title(f'{sample_ids[i]}\namplitude(E_y - incident)', fontsize=8)
-        fig.colorbar(im_scat, ax=ax_scat)
-
-    image = wandb.Image(fig)
-    plt.close(fig)
-    return {f'{train_valid}/{mode}/field_grid': image}
-
-
-def plot_helmholtz_residual(residual, mode, train_valid):
-    """Render |Helmholtz residual|^2 as a labeled heatmap (with colorbar) per field component."""
-    if mode == 'te':
-        residuals = [('', residual)]
-    else:
-        residuals = [('z', residual[0]), ('x', residual[1])]
-
-    images = {}
-    for label, r in residuals:
-        loss_map = r.abs().pow(2).numpy()
-        suffix = f'_{label}' if label else ''
-
-        fig, ax = plt.subplots(figsize=(5, 4))
-        im = ax.imshow(loss_map, origin='lower', aspect='equal')
-        fig.colorbar(im, ax=ax, label='|residual|^2')
-        ax.set_title(f'Helmholtz residual{suffix}')
-        images[f'{train_valid}/{mode}/helmholtz_loss{suffix}'] = wandb.Image(fig)
-        plt.close(fig)
-
-    return images
 
 
 def save_checkpoint(state, directory, filename):
@@ -472,6 +431,18 @@ if __name__ == '__main__':
         action="store_true",
         help="Skip validation entirely, regardless of ValidFraction, for faster overfitting runs. Also honored via SkipValid in specs_maxwell.json.",
     )
+    arg_parser.add_argument(
+        "--sample_id",
+        type=str,
+        default=None,
+        help="Restrict training to every row matching this sample_id (e.g. 'sample_0000', all its incidence angles), bypassing the shuffle/split entirely with an empty valid split. Overrides SampleId in specs_maxwell.json.",
+    )
+    arg_parser.add_argument(
+        "--theta",
+        type=float,
+        default=None,
+        help="Used together with --sample_id: further restrict to just the row(s) at this incidence angle (degrees), e.g. 0.0. Overrides SampleTheta in specs_maxwell.json.",
+    )
 
     args = arg_parser.parse_args()
-    main(args.load_ckpt, args.reset_lr, args.epochs, args.n_samples, args.skip_valid)
+    main(args.load_ckpt, args.reset_lr, args.epochs, args.n_samples, args.skip_valid, args.sample_id, args.theta)

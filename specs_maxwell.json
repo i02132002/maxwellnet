@@ -6,8 +6,8 @@
   ],
   "NetworkArch": "periodicmaxwellnet",
   "NetworkSpecs": {
-    "depth": 4,
-    "filter": 8,
+    "depth": 6,
+    "filter": 16,
     "norm": "weight",
     "up_mode": "upconv"
   },
@@ -16,15 +16,13 @@
     "pml_thickness": 10
   },
   "HFConfig": null,
-  "ObjectWeight": 1.0,
-  "ObjectThreshold": 1e-4,
   "ValidFraction": 0.1,
   "NumTrainSamples": 1,
   "SkipValid": true,
   "Seed": 2,
-  "LearningRate": 0.005,
+  "LearningRate": 0.0005,
   "LearningRateDecay": 0.5,
-  "LearningRateDecayStep": 5000,
+  "LearningRateDecayStep": 2000,
   "Epochs": 10000,
   "BatchSize": 16,
   "SnapshotFrequency": 1000,

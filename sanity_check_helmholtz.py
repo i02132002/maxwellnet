@@ -71,8 +71,11 @@ def run_case(label, wavelength_a, delta_x_a, delta_z_a, theta_deg, nz, nx, pml_t
     eps_vacuum = torch.ones(nz, nx, dtype=torch.complex64)
 
     def loss_for(E):
+        # helmholtz_residual_loss_periodic_pml now takes the envelope `a`
+        # (E = incident * (1+a)), not the total field E directly -- convert.
+        envelope = E / incident - 1.0
         residual = helmholtz_residual_loss_periodic_pml(
-            E, eps_vacuum, incident, kz, kx, 's', wavelength_a, delta_x_a, delta_z_a, pml_thickness)
+            envelope, eps_vacuum, incident, kz, kx, 's', wavelength_a, delta_x_a, delta_z_a, pml_thickness)
         return residual.abs().pow(2).mean().item(), residual
 
     loss_zero, _ = loss_for(torch.zeros_like(incident))

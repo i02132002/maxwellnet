@@ -208,7 +208,7 @@ def helmholtz_residual_loss(
 
 
 def helmholtz_residual_loss_periodic_pml(
-        E_field: Tensor,
+        envelope: Tensor,
         epsilon_map: Tensor,
         incident: Tensor,
         kz,
@@ -239,26 +239,33 @@ def helmholtz_residual_loss_periodic_pml(
     generic non-commensurate angle) — this affects both `'s'` and `'p'`
     mode's periodic-x derivatives, not just a PML-boundary-region artifact.
 
+    The total field E = incident * (1 + envelope) is reconstructed here,
+    not by the caller -- `envelope` is whatever ShapeNet.forward predicts
+    directly (a=0 -> E=incident, the zeroth-order Born approximation).
+
     The z second derivative is evaluated on the *scattered* field
-    (E_field - incident), zero-padded at each z-edge before PML grading —
-    mirroring MaxwellNet's total-field/scattered-field split (`ey_s`,
-    `padding_zero`) — with the incident wave's own z-curvature (computed
-    with the same un-stretched finite-difference stencil, not the analytic
-    -kz**2*incident — see `_lap_z_pml_scattered`) added back in. This
-    anchors the total field to the known incident wave at the z-truncation
-    boundary: without it (i.e. differencing E_field directly with replicate
-    padding, the prior behavior of this function), the bare residual is
-    exactly zero for the trivial E_field ≡ 0 solution regardless of
-    epsilon_map, and training can collapse the predicted field to near-zero
-    amplitude while still driving this loss to ~0. The returned residual
-    therefore covers the full input domain.
+    (E - incident = incident * envelope), zero-padded at each z-edge before
+    PML grading — mirroring MaxwellNet's total-field/scattered-field split
+    (`ey_s`, `padding_zero`) — with the incident wave's own z-curvature
+    (computed with the same un-stretched finite-difference stencil, not the
+    analytic -kz**2*incident — see `_lap_z_pml_scattered`) added back in.
+    This anchors the total field to the known incident wave at the
+    z-truncation boundary: without it (i.e. differencing E directly with
+    replicate padding, the prior behavior of this function), the bare
+    residual is exactly zero for the trivial envelope ≡ -1 (E ≡ 0) solution
+    regardless of epsilon_map, and training can collapse the predicted
+    field to near-zero amplitude while still driving this loss to ~0. The
+    returned residual therefore covers the full input domain.
 
     Args:
-        E_field, epsilon_map, mode, wavelength_a, delta_x_a, delta_z_a: same
+        envelope: predicted complex envelope `a` such that E = incident *
+            (1 + a), as returned by `ShapeNet.forward` (s-pol: Ey envelope;
+            p-pol: (Ez, Ex) envelopes) -- NOT the total field.
+        epsilon_map, mode, wavelength_a, delta_x_a, delta_z_a: same
             shapes/conventions as `helmholtz_residual_loss` (s-pol: Ey;
             p-pol: (Ez, Ex) / [εz, εx]).
         incident: incident plane wave e^(i k·r), same shape convention as
-            E_field but without the p-pol component axis — (Nz, Nx) or
+            envelope but without the p-pol component axis — (Nz, Nx) or
             (batch, Nz, Nx) — as returned by `ShapeNet.forward`.
         kz, kx: incident wave's z- and x-wavevector components, scalar or
             (batch,), as returned by `ShapeNet.forward`.
@@ -268,7 +275,7 @@ def helmholtz_residual_loss_periodic_pml(
             strength — defaults (4, 5) match MaxwellNet's hardcoded values.
 
     Returns:
-        Complex residual tensor, same shape as E_field ((Nz, Nx) for s-pol,
+        Complex residual tensor, same shape as envelope ((Nz, Nx) for s-pol,
         (2, Nz, Nx) for p-pol).
 
     Note: the p-pol path mirrors MaxwellNet's `dd_zx_pml`/`dd_xz_pml`
@@ -376,31 +383,43 @@ def helmholtz_residual_loss_periodic_pml(
         return h * rz_inv[1:-1].reshape(1, 1, -1, 1)
 
     if mode == 's':
-        Ey  = _ensure_4d(E_field.to(torch.complex64))
+        # squeeze() alone is ambiguous between "unbatched (Nz,Nx) input"
+        # and "batched (B,Nz,Nx) input with B==1" -- both look identical
+        # after _ensure_4d (both become (1,1,Nz,Nx)), but the former should
+        # return (Nz,Nx) while the latter must keep its (now-1-long) batch
+        # dim, or a batch-size-1 caller (e.g. a single-sample DataLoader)
+        # silently gets back a bare (Nz,Nx) tensor with no batch axis,
+        # corrupting any downstream `residual[0]` indexing.
+        is_batched = envelope.dim() >= 3
+
+        a_y = _ensure_4d(envelope.to(torch.complex64))
         eps = _ensure_4d(epsilon_map.to(torch.complex64))
         inc = _ensure_4d(incident.to(torch.complex64))
+        Ey  = (1.0 + a_y) * inc
 
         diff = _lap_z_pml_scattered(Ey, inc, kz) + _lap_x_periodic(Ey, kx) + k**2 * eps * Ey
-        return diff.squeeze()
+        return diff.squeeze(1) if is_batched else diff.squeeze()
 
     elif mode == 'p':
-        if E_field.dim() == 3:
+        if envelope.dim() == 3:
             is_batched = False
-            Ez_raw, Ex_raw = E_field[0], E_field[1]
+            az_raw, ax_raw = envelope[0], envelope[1]
             eps_z_raw, eps_x_raw = epsilon_map[0], epsilon_map[1]
-        elif E_field.dim() == 4:
+        elif envelope.dim() == 4:
             is_batched = True
-            Ez_raw, Ex_raw = E_field[:, 0], E_field[:, 1]
+            az_raw, ax_raw = envelope[:, 0], envelope[:, 1]
             eps_z_raw, eps_x_raw = epsilon_map[:, 0], epsilon_map[:, 1]
         else:
             raise ValueError(
-                "p-pol E_field must have shape (2, Nz, Nx) [Ez, Ex] or (batch, 2, Nz, Nx)")
+                "p-pol envelope must have shape (2, Nz, Nx) [Ez, Ex] or (batch, 2, Nz, Nx)")
 
-        Ez    = _ensure_4d(Ez_raw.to(torch.complex64))
-        Ex    = _ensure_4d(Ex_raw.to(torch.complex64))
+        a_z   = _ensure_4d(az_raw.to(torch.complex64))
+        a_x   = _ensure_4d(ax_raw.to(torch.complex64))
         eps_z = _ensure_4d(eps_z_raw.to(torch.complex64))
         eps_x = _ensure_4d(eps_x_raw.to(torch.complex64))
         inc   = _ensure_4d(incident.to(torch.complex64))
+        Ez    = (1.0 + a_z) * inc
+        Ex    = (1.0 + a_x) * inc
 
         diff_z = (_lap_x_periodic(Ez, kx) - _d_x_d_z_pml(Ex, kx) + k**2 * eps_z * Ez).squeeze(1)
         diff_x = (_lap_z_pml_scattered(Ex, inc, kz) - _d_z_d_x_pml(Ez, kx) + k**2 * eps_x * Ex).squeeze(1)

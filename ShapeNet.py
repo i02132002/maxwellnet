@@ -122,15 +122,18 @@ class PeriodicMaxwellNet(nn.Module):
             delta_x_a, delta_z_a: (B,) grid spacing in angstroms.
 
         Returns:
-            (field_pred, epsilon_map, incident, kz, kx):
-                field_pred: predicted total complex field, (B, Nz, Nx) for
-                    'te' (Ey), or (B, 2, Nz, Nx) for 'tm' ([Ez, Ex]).
+            (envelope, epsilon_map, incident, kz, kx):
+                envelope: predicted complex envelope `a` such that the total
+                    field E = incident * (1 + a), (B, Nz, Nx) for 'te' (Ey),
+                    or (B, 2, Nz, Nx) for 'tm' ([Ez, Ex]) -- NOT the total
+                    field itself; downstream code (the physics loss, any
+                    plotting) reconstructs E = incident * (1 + envelope)
+                    itself wherever it needs the total field.
                 epsilon_map: matching epsilon (optical_constant**2), same
-                    shape convention as field_pred — pass both straight into
+                    shape convention as envelope — pass both straight into
                     `helmholtz_residual_loss_periodic_pml`.
                 incident: incident plane wave e^(i k·r), (B, Nz, Nx) complex64
-                    — same for every field_pred channel, useful for isolating
-                    the scattered field (field_pred - incident).
+                    — same for every envelope channel.
                 kz, kx: incident wave's z- and x-components of the
                     wavevector, (B,) each — needed alongside `incident` to
                     anchor the z-PML residual and Bloch-correct the periodic
@@ -155,15 +158,17 @@ class PeriodicMaxwellNet(nn.Module):
         if pad_x:
             out = out[..., :, :-pad_x]
 
-        # The network predicts a slowly-varying envelope of the total field;
-        # add 1 (unit incident amplitude) and multiply by the incident plane
-        # wave e^(i k·r) to recover the total field.
-        envelope = torch.complex(out[:, :k] + 1, out[:, k:2 * k])
+        # The network predicts a slowly-varying envelope `a` of the total
+        # field -- zero-init (see __init__) makes out=0 at the start of
+        # training, so a=0 -> E=incident, the zeroth-order Born
+        # approximation. The total field E = incident * (1 + a) is
+        # reconstructed by downstream code, not here -- `a` itself (NOT
+        # 1+a) is what's returned.
+        envelope = torch.complex(out[:, :k], out[:, k:2 * k])
         incident = self._incident_wave(kx, kz, nz, nx, delta_x_a, delta_z_a)  # (B, Ny, Nx)
-        field = envelope * incident.unsqueeze(1)
 
         if self.mode == 'te':
-            field = field[:, 0]
+            envelope = envelope[:, 0]
             eps = eps[:, 0]
 
-        return field, eps, incident, kz, kx
+        return envelope, eps, incident, kz, kx

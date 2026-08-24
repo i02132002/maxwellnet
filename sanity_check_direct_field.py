@@ -6,9 +6,10 @@
 # PeriodicMaxwellNet's UNet with a bare per-pixel parameter tensor (the same
 # shape/interpretation the UNet's output would have) and runs the *real*
 # `net.forward()` on top of it -- so padding/cropping, epsilon selection,
-# incident-wave construction, and the complex-envelope reconstruction
-# (E = (1+a) * E_i) are all exactly the production code path, not a
-# reimplementation of it. Only the UNet itself is swapped out.
+# and incident-wave construction are all exactly the production code path,
+# not a reimplementation of it. Only the UNet itself is swapped out.
+# `net.forward()` returns the envelope `a` directly (E = (1+a) * E_i is
+# reconstructed by the loss function / caller, not by the model).
 #
 # Interpretation of the result:
 #   - RMS|a| grows well above 0 (and doesn't sit near 1): the residual
@@ -54,7 +55,7 @@ class DirectField(nn.Module):
 def plot_residual(residual, step, out_dir):
     loss_map = residual.detach().abs().pow(2).cpu().numpy()
     fig, ax = plt.subplots(figsize=(5, 4))
-    im = ax.imshow(loss_map, origin='lower', aspect='equal')
+    im = ax.imshow(loss_map, origin='lower', aspect='equal', cmap='magma')
     fig.colorbar(im, ax=ax, label='|residual|^2')
     ax.set_title(f'Helmholtz residual (step {step})')
     os.makedirs(out_dir, exist_ok=True)
@@ -97,11 +98,15 @@ def main(steps, lr, log_every, plot_every, clip, plot_dir):
           + (f", grad_clip={clip}" if clip else ""))
 
     for step in range(steps):
-        field, eps, incident, kz, kx = net(
+        # net() (ShapeNet.forward) now returns the envelope `a` directly
+        # (E_total = incident * (1+a)), not the reconstructed total field --
+        # helmholtz_residual_loss_periodic_pml also now takes the envelope
+        # directly, so no reconstruction is needed for the loss itself.
+        envelope, eps, incident, kz, kx = net(
             optical_constant, theta, wavelength_nm, delta_x_a, delta_z_a)
 
         residual = helmholtz_residual_loss_periodic_pml(
-            field, eps, incident, kz, kx, pol, wavelength_a,
+            envelope, eps, incident, kz, kx, pol, wavelength_a,
             float(sample['delta_x_a']), float(sample['delta_z_a']), pml_thickness)
 
         is_object = (eps - 1.0).abs() > object_threshold
@@ -116,14 +121,8 @@ def main(steps, lr, log_every, plot_every, clip, plot_dir):
 
         if step % log_every == 0 or step == steps - 1:
             with torch.no_grad():
-                # a = E/E_i - 1, derived from the actual field/incident (rather
-                # than assumed channel layout) so this stays correct for both
-                # 'te' (field, incident same shape) and 'tm' (field has an
-                # extra component axis) modes.
-                a = field / incident.unsqueeze(1) if field.dim() == incident.dim() + 1 else field / incident
-                a = a - 1
-                a_rms = a.abs().pow(2).mean().sqrt().item()
-                a_max = a.abs().max().item()
+                a_rms = envelope.abs().pow(2).mean().sqrt().item()
+                a_max = envelope.abs().max().item()
             print(f"step {step:6d}  loss={loss.item():.6e}  RMS|a|={a_rms:.4e}  max|a|={a_max:.4e}")
 
         if step == steps - 1 or (plot_every and step % plot_every == 0):
@@ -131,10 +130,8 @@ def main(steps, lr, log_every, plot_every, clip, plot_dir):
             print(f"  saved {path}")
 
     with torch.no_grad():
-        a_final = field / incident.unsqueeze(1) if field.dim() == incident.dim() + 1 else field / incident
-        a_final = a_final - 1
-        rms_a = a_final.abs().pow(2).mean().sqrt().item()
-        rms_a_vs_minus1 = (a_final + 1.0).abs().pow(2).mean().sqrt().item()
+        rms_a = envelope.abs().pow(2).mean().sqrt().item()
+        rms_a_vs_minus1 = (envelope + 1.0).abs().pow(2).mean().sqrt().item()
 
     print("\n" + "=" * 70)
     print(f"final RMS|a|        = {rms_a:.4e}")

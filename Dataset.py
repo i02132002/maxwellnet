@@ -42,7 +42,7 @@ class ShapeDataset(torch.utils.data.Dataset):
             ).select_columns(self._COLUMNS)
 
     @classmethod
-    def load_train_valid(cls, config, mode, valid_fraction=0.1, seed=0, n_samples=None):
+    def load_train_valid(cls, config, mode, valid_fraction=0.1, seed=0, n_samples=None, sample_id=None, theta=None):
         """Load the HF dataset filtered to the polarization matching `mode`
         ('te' -> 's', 'tm' -> 'p'), then split into train/valid ShapeDatasets,
         grouped by `sample_id` so rows sharing a sample_id (e.g. its s/p-pol
@@ -51,13 +51,34 @@ class ShapeDataset(torch.utils.data.Dataset):
 
         `n_samples`, if given, caps the training split to the first
         `n_samples` unique sample_ids (post-shuffle, pre-valid-split) --
-        e.g. for overfitting sanity checks on a handful of samples."""
+        e.g. for overfitting sanity checks on a handful of samples.
+
+        `sample_id`, if given (a single sample_id string, or a list of
+        them), bypasses the shuffle/split entirely and routes every row
+        matching that id (e.g. all of its incidence angles) into the train
+        split, with an empty valid split -- for targeting one specific,
+        known structure directly rather than whichever one happens to land
+        first after shuffling. `n_samples`/`valid_fraction` are ignored
+        when this is given. `theta`, if also given alongside `sample_id`,
+        further restricts to just the row(s) at that incidence angle
+        (degrees) rather than every angle for that sample_id."""
         pol = 's' if mode == 'te' else 'p'
         full = load_dataset(
             "als-rixs/latent-image-training", config, split="train", revision="fixed-dimension",
         ).select_columns(cls._COLUMNS).filter(lambda r: r["pol"] == pol)
 
         sample_ids = full["sample_id"]
+
+        if sample_id is not None:
+            wanted = {sample_id} if isinstance(sample_id, str) else set(sample_id)
+            if theta is not None:
+                thetas = full["theta"]
+                train_indices = [i for i, (sid, th) in enumerate(zip(sample_ids, thetas))
+                                 if sid in wanted and abs(th - theta) < 1e-6]
+            else:
+                train_indices = [i for i, sid in enumerate(sample_ids) if sid in wanted]
+            return cls(hf_dataset=full.select(train_indices)), cls(hf_dataset=full.select([]))
+
         unique_ids = sorted(set(sample_ids))
         random.Random(seed).shuffle(unique_ids)
         n_valid = round(len(unique_ids) * valid_fraction)
@@ -86,6 +107,8 @@ class ShapeDataset(torch.utils.data.Dataset):
         # helmholtz_checker (periodic-x/PML-z residual) consume this same
         # cropped array, so they see a consistent grid.
         optical_constant = optical_constant[:-1, :-1, :]
+
+        #optical_constant = 1.0 + 10.0 * np.abs(optical_constant - 1.0)
 
         delta_x_a = 1.0
         delta_z_a = 1.0
