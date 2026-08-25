@@ -63,9 +63,18 @@ class ShapeDataset(torch.utils.data.Dataset):
         further restricts to just the row(s) at that incidence angle
         (degrees) rather than every angle for that sample_id."""
         pol = 's' if mode == 'te' else 'p'
-        full = load_dataset(
+        raw = load_dataset(
             "als-rixs/latent-image-training", config, split="train", revision="fixed-dimension",
-        ).select_columns(cls._COLUMNS).filter(lambda r: r["pol"] == pol)
+        )
+        # .filter(lambda r: ...) materializes every selected column (Python
+        # dict per row) just to evaluate the predicate -- even restricted to
+        # cls._COLUMNS, that still includes the large (Ny, Nx, 3) float64
+        # optical_constant arrays, making this take minutes for a predicate
+        # that only needs 'pol'. Pull that one lightweight column via fast
+        # columnar access first to find matching row indices, then select
+        # only those rows' worth of the actual needed columns.
+        matching_indices = [i for i, p in enumerate(raw["pol"]) if p == pol]
+        full = raw.select_columns(cls._COLUMNS).select(matching_indices)
 
         sample_ids = full["sample_id"]
 

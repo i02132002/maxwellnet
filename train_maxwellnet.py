@@ -23,6 +23,7 @@ from datetime import datetime
 
 def main(load_ckpt, reset_lr=False, epochs_override=None, n_samples=None, skip_valid=False, sample_id=None, theta=None):
     directory = "test_run1"
+    os.makedirs(directory, exist_ok=True)
     logging.basicConfig(level=logging.DEBUG,
                         format='%(asctime)s %(filename)s[line:%(lineno)d] %(levelname)s %(message)s',
                         datefmt='%a, %d %b %Y %H:%M:%S',
