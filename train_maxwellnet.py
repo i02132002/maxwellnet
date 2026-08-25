@@ -123,7 +123,17 @@ def main(load_ckpt, reset_lr=False, epochs_override=None, n_samples=None, skip_v
     # Fetching a sample means decoding an HF Arrow row (numpy conversion of
     # the optical_constant array), which is CPU-bound and otherwise
     # serializes with GPU/MPS compute; worker processes overlap it instead.
-    num_workers = get_spec_with_default(specs, "NumWorkers", min(8, os.cpu_count() or 0))
+    # os.cpu_count() reports the whole machine's core count, not what's
+    # actually allocated to this process -- on a shared cluster node under
+    # SLURM/cgroups (e.g. a job given 2 of a node's many cores), that
+    # overshoots badly and triggers DataLoader's own "excessive worker"
+    # warning. os.sched_getaffinity(0) (Linux-only, hence the guard)
+    # reports the CPU set this process can actually run on.
+    try:
+        available_cpus = len(os.sched_getaffinity(0))
+    except AttributeError:
+        available_cpus = os.cpu_count() or 0
+    num_workers = get_spec_with_default(specs, "NumWorkers", min(8, available_cpus))
     # Cap below the dataset size so an overfitting run (n_samples small)
     # doesn't spin up worker processes it has nothing to hand them.
     train_num_workers = min(num_workers, len(train_dataset))
