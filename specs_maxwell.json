@@ -6,8 +6,8 @@
   ],
   "NetworkArch": "periodicmaxwellnet",
   "NetworkSpecs": {
-    "depth": 6,
-    "filter": 16,
+    "depth": 5,
+    "filter": 32,
     "norm": "weight",
     "up_mode": "upconv"
   },
@@ -17,22 +17,22 @@
   },
   "HFConfig": null,
   "ValidFraction": 0.1,
-  "NumTrainSamples": null,
-  "SampleId": null,
+  "NumTrainSamples": 1,
+  "SampleId": "sample_0000",
   "SampleTheta": null,
-  "ForceValidIds": ["sample_0000"],
+  "ForceValidIds": null,
   "SkipValid": false,
   "Seed": 2,
-  "LearningRate": 0.0005,
+  "LearningRate": 0.00001,
   "LearningRateDecay": 0.5,
-  "LearningRateDecayStep": 2000,
-  "Epochs": 10000,
+  "LearningRateDecayStep": 5000,
+  "Epochs": 40000,
   "BatchSize": 16,
   "SnapshotFrequency": 1000,
   "WandB": {
     "Project": "maxwellnet",
     "Entity": "als-rixs",
     "Mode": "online",
-    "LogFrequency": 10
+    "LogFrequency": 1000
   }
 }

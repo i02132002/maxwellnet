@@ -27,12 +27,15 @@ class ShapeDataset(torch.utils.data.Dataset):
     training MaxwellNet against the Helmholtz residual loss (no ground-truth
     E-field is needed, so it is not part of this dataset)."""
 
-    # Columns __getitem__ actually reads; the dataset also carries several
-    # unused (Ny, Nx, 3) float64 arrays (e_inc, p_inc, e_field) that are
+    # Columns __getitem__ actually reads; the dataset also carries a couple
+    # more unused (Ny, Nx, 3) float64 arrays (e_inc, p_inc) that stay
     # dropped via select_columns since converting them from Arrow per-row is
-    # the dominant cost of loading a sample otherwise.
+    # expensive otherwise. e_field (the FEM ground-truth total field) is
+    # kept for eval plotting (comparing the model's E_total against it), not
+    # used by the physics loss itself.
     _COLUMNS = ['sample_id', 'optical_constant_real', 'optical_constant_imag', 'wavelength_nm',
-                'x0_A', 'y0_A', 'z0_A', 'grid_nx', 'grid_ny', 'pol', 'theta']
+                'x0_A', 'y0_A', 'z0_A', 'grid_nx', 'grid_ny', 'pol', 'theta',
+                'e_field_real', 'e_field_imag']
 
     def __init__(self, config=None, split=None, hf_dataset=None):
         if hf_dataset is not None:
@@ -150,12 +153,16 @@ class ShapeDataset(torch.utils.data.Dataset):
 
         #optical_constant = 1.0 + 10.0 * np.abs(optical_constant - 1.0)
 
+        e_field = (np.asarray(r["e_field_real"]) + 1j * np.asarray(r["e_field_imag"]))
+        e_field = e_field[:-1, :-1, :]
+
         delta_x_a = 1.0
         delta_z_a = 1.0
 
         item = {
             "sample_id": r["sample_id"],
             "optical_constant": torch.from_numpy(optical_constant),
+            "e_field": torch.from_numpy(e_field),
             "wavelength_nm": r["wavelength_nm"],
             "x0_A": r["x0_A"],
             "y0_A": r["y0_A"],

@@ -275,7 +275,7 @@ def _compute_loss(data, model, device, mode, pml_thickness):
 def train(train_loader, model, optimizer, epoch, loss_train, device, mode, pml_thickness, log_freq):
     model.train()
     n_batches = len(train_loader)
-    log_envelope = log_residual = log_incident = log_sample_ids = log_theta = None
+    log_envelope = log_residual = log_incident = log_e_field = log_sample_ids = log_theta = None
     with torch.set_grad_enabled(True):
         count = 0
 
@@ -300,6 +300,7 @@ def train(train_loader, model, optimizer, epoch, loss_train, device, mode, pml_t
                 log_envelope = envelope.detach().cpu()
                 log_residual = residual.detach().cpu()
                 log_incident = incident.detach().cpu()
+                log_e_field = data['e_field'].detach().cpu()
                 log_sample_ids = list(data['sample_id'])
                 log_theta = data['theta'].detach().cpu().tolist()
 
@@ -307,12 +308,13 @@ def train(train_loader, model, optimizer, epoch, loss_train, device, mode, pml_t
 
     wandb.log({'train/loss': loss_train[epoch-1].item(), 'epoch': epoch})
     if log_freq and epoch % log_freq == 0:
-        log_fields_to_wandb(log_envelope, log_residual, log_incident, log_sample_ids, log_theta, mode, 'train', epoch)
+        log_fields_to_wandb(log_envelope, log_residual, log_incident, log_e_field,
+                            log_sample_ids, log_theta, mode, 'train', epoch)
 
 
 def valid(valid_loader, model, epoch, loss_valid, device, mode, pml_thickness):
     model.eval()
-    log_envelope = log_residual = log_incident = log_sample_ids = log_theta = None
+    log_envelope = log_residual = log_incident = log_e_field = log_sample_ids = log_theta = None
     with torch.set_grad_enabled(False):
         count = 0
 
@@ -329,13 +331,15 @@ def valid(valid_loader, model, epoch, loss_valid, device, mode, pml_thickness):
                 log_envelope = envelope.detach().cpu()
                 log_residual = residual.detach().cpu()
                 log_incident = incident.detach().cpu()
+                log_e_field = data['e_field'].detach().cpu()
                 log_sample_ids = list(data['sample_id'])
                 log_theta = data['theta'].detach().cpu().tolist()
 
         loss_valid[epoch-1] = loss_valid[epoch-1] / count
 
     wandb.log({'valid/loss': loss_valid[epoch-1].item(), 'epoch': epoch})
-    log_fields_to_wandb(log_envelope, log_residual, log_incident, log_sample_ids, log_theta, mode, 'valid', epoch)
+    log_fields_to_wandb(log_envelope, log_residual, log_incident, log_e_field,
+                        log_sample_ids, log_theta, mode, 'valid', epoch)
 
 
 # Cap how many samples in the logged batch get their own figure, so a
@@ -345,44 +349,57 @@ def valid(valid_loader, model, epoch, loss_valid, device, mode, pml_thickness):
 MAX_LOGGED_SAMPLES = 8
 
 
-def _sample_panels(a, r, inc):
-    """The 5 (part, title) panels shown per sample: real/amplitude of the
+# e_field's last dim is 3 components ordered [Ez, Ex, Ey] (matching
+# ShapeNet._EPS_INDEX); 'te' (s-pol) only has a nonzero Ey (index 2), 'tm'
+# ground-truth plotting here only shows Ez (index 0), matching the 'x'
+# component already being omitted from the envelope/residual panels below.
+_E_FIELD_CHANNEL = {'te': 2, 'tm': 0}
+
+
+def _fft_log_intensity(field_abs):
+    """log10(|FFT2(field)|^2 + eps), DC-centered -- field_abs is a real 2D
+    tensor (an amplitude map), so the spectrum's symmetry doesn't matter
+    for visualization; this is purely a diagnostic for how much
+    high-spatial-frequency content a field amplitude map carries."""
+    spectrum = torch.fft.fftshift(torch.fft.fft2(field_abs))
+    return torch.log10(spectrum.abs().pow(2) + 1e-12)
+
+
+def _sample_panels(a, r, inc, e_gt):
+    """The 8 (part, title) panels shown per sample: real/amplitude of the
     envelope, real/amplitude of the reconstructed total field E_total =
-    incident * (1 + envelope), and |residual|^2. imaginary(envelope) is
-    deliberately omitted to keep each sample's block to 5 columns."""
+    incident * (1 + envelope) and its 2D-FFT log intensity, the FEM
+    ground-truth field's amplitude and its 2D-FFT log intensity, and
+    |residual|^2. imaginary(envelope) is deliberately omitted to keep each
+    sample's row from growing further."""
     e_total = (1.0 + a) * inc
+    e_total_amp = e_total.abs()
+    e_gt_amp = e_gt.abs()
     return [
         (a.real, 'real(envelope)'),
         (a.abs(), 'amplitude(envelope)'),
         (e_total.real, 'real(E_total)'),
-        (e_total.abs(), 'amplitude(E_total)'),
+        (e_total_amp, 'amplitude(E_total)'),
+        (_fft_log_intensity(e_total_amp), 'log|FFT(amp(E_total))|^2'),
+        (e_gt_amp, 'amplitude(E_field) [FEM]'),
+        (_fft_log_intensity(e_gt_amp), 'log|FFT(amp(E_field))|^2 [FEM]'),
         (r.abs().pow(2), '|residual|^2'),
     ]
 
 
-_PANELS_PER_SAMPLE = 5
-_SAMPLES_PER_ROW = 2
+_PANELS_PER_SAMPLE = 8
 
 
-def _plot_angle_group(indices, envelope, residual, incident, sample_ids, mode):
-    """One figure per incidence angle, tiling every sample sharing that
-    angle as a _SAMPLES_PER_ROW-column grid of per-sample blocks (each
-    block: the 5 panels from _sample_panels)."""
+def _plot_angle_group(indices, envelope, residual, incident, e_field, sample_ids, mode):
+    """One figure per incidence angle: one row per sample, each row the 8
+    panels from _sample_panels."""
     n_samples = len(indices)
-    nrows = (n_samples + _SAMPLES_PER_ROW - 1) // _SAMPLES_PER_ROW  # ceil
-    ncols = _SAMPLES_PER_ROW * _PANELS_PER_SAMPLE
-    fig, axes = plt.subplots(nrows, ncols, figsize=(ncols * 3.2, nrows * 3.2), constrained_layout=True)
+    ncols = _PANELS_PER_SAMPLE
+    fig, axes = plt.subplots(n_samples, ncols, figsize=(ncols * 3.2, n_samples * 3.2), constrained_layout=True)
     axes = np.atleast_2d(axes)
 
-    for slot in range(nrows * _SAMPLES_PER_ROW):
-        row, col_block = divmod(slot, _SAMPLES_PER_ROW)
-        col0 = col_block * _PANELS_PER_SAMPLE
-        if slot >= n_samples:
-            for k in range(_PANELS_PER_SAMPLE):
-                axes[row, col0 + k].axis('off')
-            continue
-
-        i = indices[slot]
+    for row, i in enumerate(indices):
+        e_gt = e_field[i, ..., _E_FIELD_CHANNEL[mode]]
         if mode == 'te':
             a, r, inc = envelope[i], residual[i], incident[i]
         else:
@@ -390,8 +407,8 @@ def _plot_angle_group(indices, envelope, residual, incident, sample_ids, mode):
             # use case for this layout, so the 'x' component isn't tiled.
             a, r, inc = envelope[i, 0], residual[i, 0], incident[i]
 
-        for k, (part, title) in enumerate(_sample_panels(a, r, inc)):
-            ax = axes[row, col0 + k]
+        for k, (part, title) in enumerate(_sample_panels(a, r, inc, e_gt)):
+            ax = axes[row, k]
             im = ax.imshow(part.numpy(), origin='lower', aspect='equal', cmap='magma')
             ax.set_title(f'{sample_ids[i]}\n{title}', fontsize=8)
             fig.colorbar(im, ax=ax)
@@ -399,11 +416,11 @@ def _plot_angle_group(indices, envelope, residual, incident, sample_ids, mode):
     return fig
 
 
-def log_fields_to_wandb(envelope, residual, incident, sample_ids, theta, mode, train_valid, epoch):
+def log_fields_to_wandb(envelope, residual, incident, e_field, sample_ids, theta, mode, train_valid, epoch):
     """Group the logged batch (up to MAX_LOGGED_SAMPLES) by incidence
     angle, and produce one combined figure per angle -- rather than one
-    figure per sample -- tiling every sample sharing that angle into a
-    _SAMPLES_PER_ROW-column grid (see _plot_angle_group)."""
+    figure per sample -- tiling every sample sharing that angle as one row
+    each (see _plot_angle_group)."""
     n = min(len(sample_ids), MAX_LOGGED_SAMPLES)
     angle_groups = {}
     for i in range(n):
@@ -411,7 +428,7 @@ def log_fields_to_wandb(envelope, residual, incident, sample_ids, theta, mode, t
 
     images = {}
     for angle, indices in angle_groups.items():
-        fig = _plot_angle_group(indices, envelope, residual, incident, sample_ids, mode)
+        fig = _plot_angle_group(indices, envelope, residual, incident, e_field, sample_ids, mode)
         images[f'{train_valid}/{mode}/envelope_residual_theta{angle:.0f}'] = wandb.Image(fig)
         plt.close(fig)
 
