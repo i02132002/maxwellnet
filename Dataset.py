@@ -40,6 +40,13 @@ class ShapeDataset(torch.utils.data.Dataset):
             self.dataset = load_dataset(
                 "als-rixs/latent-image-training", config, split=split, revision="fixed-dimension",
             ).select_columns(self._COLUMNS)
+        # HF `datasets`' default row access decodes each row's (Ny, Nx, 3)
+        # array columns from Arrow into nested Python lists from scratch on
+        # every call (~150ms/row here) -- with persistent_workers=True this
+        # cost is paid every epoch even though the underlying data never
+        # changes. Cache the decoded item per (worker-local) process so only
+        # the first epoch pays it; every later epoch is a plain dict lookup.
+        self._cache = [None] * len(self.dataset)
 
     @classmethod
     def load_train_valid(cls, config, mode, valid_fraction=0.1, seed=0, n_samples=None, sample_id=None, theta=None):
@@ -107,6 +114,10 @@ class ShapeDataset(torch.utils.data.Dataset):
         return len(self.dataset)
 
     def __getitem__(self, idx):
+        cached = self._cache[idx]
+        if cached is not None:
+            return cached
+
         r = self.dataset[idx]
 
         optical_constant = (np.asarray(r["optical_constant_real"])
@@ -122,7 +133,7 @@ class ShapeDataset(torch.utils.data.Dataset):
         delta_x_a = 1.0
         delta_z_a = 1.0
 
-        return {
+        item = {
             "sample_id": r["sample_id"],
             "optical_constant": torch.from_numpy(optical_constant),
             "wavelength_nm": r["wavelength_nm"],
@@ -136,3 +147,5 @@ class ShapeDataset(torch.utils.data.Dataset):
             "delta_x_a": delta_x_a,
             "delta_z_a": delta_z_a,
         }
+        self._cache[idx] = item
+        return item

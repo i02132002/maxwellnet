@@ -345,43 +345,75 @@ def valid(valid_loader, model, epoch, loss_valid, device, mode, pml_thickness, l
 MAX_LOGGED_SAMPLES = 8
 
 
-def log_fields_to_wandb(envelope, residual, incident, sample_ids, theta, mode, train_valid, epoch):
-    """Plot real, imaginary, and amplitude of the predicted envelope; real
-    and amplitude of the reconstructed total field E_total = incident *
-    (1 + envelope); and the Helmholtz residual (|residual|^2) -- one
-    figure per sample in the batch (up to MAX_LOGGED_SAMPLES), labeled by
-    sample_id and incidence angle so e.g. the same sample_id at different
-    angles is distinguishable rather than only the first batch entry."""
-    n = min(len(sample_ids), MAX_LOGGED_SAMPLES)
-    images = {}
-    for i in range(n):
-        label = f'{sample_ids[i]}_theta{theta[i]:.0f}'
+def _sample_panels(a, r, inc):
+    """The 5 (part, title) panels shown per sample: real/amplitude of the
+    envelope, real/amplitude of the reconstructed total field E_total =
+    incident * (1 + envelope), and |residual|^2. imaginary(envelope) is
+    deliberately omitted to keep each sample's block to 5 columns."""
+    e_total = (1.0 + a) * inc
+    return [
+        (a.real, 'real(envelope)'),
+        (a.abs(), 'amplitude(envelope)'),
+        (e_total.real, 'real(E_total)'),
+        (e_total.abs(), 'amplitude(E_total)'),
+        (r.abs().pow(2), '|residual|^2'),
+    ]
+
+
+_PANELS_PER_SAMPLE = 5
+_SAMPLES_PER_ROW = 2
+
+
+def _plot_angle_group(indices, envelope, residual, incident, sample_ids, mode):
+    """One figure per incidence angle, tiling every sample sharing that
+    angle as a _SAMPLES_PER_ROW-column grid of per-sample blocks (each
+    block: the 5 panels from _sample_panels)."""
+    n_samples = len(indices)
+    nrows = (n_samples + _SAMPLES_PER_ROW - 1) // _SAMPLES_PER_ROW  # ceil
+    ncols = _SAMPLES_PER_ROW * _PANELS_PER_SAMPLE
+    fig, axes = plt.subplots(nrows, ncols, figsize=(ncols * 3.2, nrows * 3.2), constrained_layout=True)
+    axes = np.atleast_2d(axes)
+
+    for slot in range(nrows * _SAMPLES_PER_ROW):
+        row, col_block = divmod(slot, _SAMPLES_PER_ROW)
+        col0 = col_block * _PANELS_PER_SAMPLE
+        if slot >= n_samples:
+            for k in range(_PANELS_PER_SAMPLE):
+                axes[row, col0 + k].axis('off')
+            continue
+
+        i = indices[slot]
         if mode == 'te':
-            components = [('', envelope[i], residual[i], incident[i])]
+            a, r, inc = envelope[i], residual[i], incident[i]
         else:
-            components = [('_z', envelope[i, 0], residual[i, 0], incident[i]),
-                          ('_x', envelope[i, 1], residual[i, 1], incident[i])]
+            # tm: this grid shows the 'z' component only; not the primary
+            # use case for this layout, so the 'x' component isn't tiled.
+            a, r, inc = envelope[i, 0], residual[i, 0], incident[i]
 
-        for suffix, a, r, inc in components:
-            e_total = (1.0 + a) * inc
+        for k, (part, title) in enumerate(_sample_panels(a, r, inc)):
+            ax = axes[row, col0 + k]
+            im = ax.imshow(part.numpy(), origin='lower', aspect='equal', cmap='magma')
+            ax.set_title(f'{sample_ids[i]}\n{title}', fontsize=8)
+            fig.colorbar(im, ax=ax)
 
-            fig, axes = plt.subplots(1, 6, figsize=(30, 4), constrained_layout=True)
-            for ax, part, title in zip(axes[:3], (a.real, a.imag, a.abs()), ('real', 'imaginary', 'amplitude')):
-                im = ax.imshow(part.numpy(), origin='lower', aspect='equal', cmap='magma')
-                ax.set_title(f'{label}\n{title}(envelope){suffix}', fontsize=9)
-                fig.colorbar(im, ax=ax)
+    return fig
 
-            for ax, part, title in zip(axes[3:5], (e_total.real, e_total.abs()), ('real', 'amplitude')):
-                im = ax.imshow(part.numpy(), origin='lower', aspect='equal', cmap='magma')
-                ax.set_title(f'{label}\n{title}(E_total){suffix}', fontsize=9)
-                fig.colorbar(im, ax=ax)
 
-            im = axes[5].imshow(r.abs().pow(2).numpy(), origin='lower', aspect='equal', cmap='magma')
-            axes[5].set_title(f'{label}\n|residual|^2{suffix}', fontsize=9)
-            fig.colorbar(im, ax=axes[5])
+def log_fields_to_wandb(envelope, residual, incident, sample_ids, theta, mode, train_valid, epoch):
+    """Group the logged batch (up to MAX_LOGGED_SAMPLES) by incidence
+    angle, and produce one combined figure per angle -- rather than one
+    figure per sample -- tiling every sample sharing that angle into a
+    _SAMPLES_PER_ROW-column grid (see _plot_angle_group)."""
+    n = min(len(sample_ids), MAX_LOGGED_SAMPLES)
+    angle_groups = {}
+    for i in range(n):
+        angle_groups.setdefault(round(theta[i], 3), []).append(i)
 
-            images[f'{train_valid}/{mode}/envelope_residual/{label}{suffix}'] = wandb.Image(fig)
-            plt.close(fig)
+    images = {}
+    for angle, indices in angle_groups.items():
+        fig = _plot_angle_group(indices, envelope, residual, incident, sample_ids, mode)
+        images[f'{train_valid}/{mode}/envelope_residual_theta{angle:.0f}'] = wandb.Image(fig)
+        plt.close(fig)
 
     images['epoch'] = epoch
     wandb.log(images)

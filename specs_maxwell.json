@@ -20,7 +20,7 @@
   "NumTrainSamples": null,
   "SampleId": null,
   "SampleTheta": null,
-  "SkipValid": true,
+  "SkipValid": false,
   "Seed": 2,
   "LearningRate": 0.0005,
   "LearningRateDecay": 0.5,
@@ -32,6 +32,6 @@
     "Project": "maxwellnet",
     "Entity": "als-rixs",
     "Mode": "online",
-    "LogFrequency": 100
+    "LogFrequency": 10
   }
 }
