@@ -33,7 +33,7 @@ from torch import nn
 
 from Dataset import ShapeDataset
 from ShapeNet import PeriodicMaxwellNet
-from losses.helmholtz_checker import helmholtz_residual_loss_periodic_pml
+from maxwell_losses.helmholtz_checker import helmholtz_residual_loss_periodic_pml
 
 
 class DirectField(nn.Module):

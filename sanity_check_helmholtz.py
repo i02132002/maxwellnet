@@ -24,7 +24,7 @@ import math
 import torch
 
 from Dataset import ShapeDataset
-from losses.helmholtz_checker import helmholtz_residual_loss_periodic_pml
+from maxwell_losses.helmholtz_checker import helmholtz_residual_loss_periodic_pml
 
 
 def region_energies(residual, pml_thickness, x_edge_width=4):
