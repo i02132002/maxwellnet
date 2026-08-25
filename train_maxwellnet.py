@@ -115,10 +115,11 @@ def main(load_ckpt, reset_lr=False, epochs_override=None, n_samples=None, skip_v
     n_samples = n_samples if n_samples is not None else get_spec_with_default(specs, "NumTrainSamples", None)
     sample_id = sample_id if sample_id is not None else get_spec_with_default(specs, "SampleId", None)
     theta = theta if theta is not None else get_spec_with_default(specs, "SampleTheta", None)
+    force_valid_ids = get_spec_with_default(specs, "ForceValidIds", None)
     skip_valid = skip_valid or get_spec_with_default(specs, "SkipValid", False)
     train_dataset, valid_dataset = ShapeDataset.load_train_valid(
         hf_config, mode, valid_fraction, seed_number if seed_number is not None else 0,
-        n_samples=n_samples, sample_id=sample_id, theta=theta)
+        n_samples=n_samples, sample_id=sample_id, theta=theta, force_valid_ids=force_valid_ids)
 
     # Fetching a sample means decoding an HF Arrow row (numpy conversion of
     # the optical_constant array), which is CPU-bound and otherwise
@@ -188,9 +189,9 @@ def main(load_ckpt, reset_lr=False, epochs_override=None, n_samples=None, skip_v
               device, mode, pml_thickness, log_freq)
         logging.info("[Train] {} epoch. Loss: {:.5f}".format(
             epoch, loss_train[epoch-1].item())) if rank == 0 else None
-        if perform_valid:
+        if perform_valid and log_freq and epoch % log_freq == 0:
             valid(valid_loader, model, epoch, loss_valid,
-                  device, mode, pml_thickness, log_freq)
+                  device, mode, pml_thickness)
             logging.info("[Valid] {} epoch. Loss: {:.5f}".format(
                 epoch, loss_valid[epoch-1].item())) if rank == 0 else None
 
@@ -309,7 +310,7 @@ def train(train_loader, model, optimizer, epoch, loss_train, device, mode, pml_t
         log_fields_to_wandb(log_envelope, log_residual, log_incident, log_sample_ids, log_theta, mode, 'train', epoch)
 
 
-def valid(valid_loader, model, epoch, loss_valid, device, mode, pml_thickness, log_freq):
+def valid(valid_loader, model, epoch, loss_valid, device, mode, pml_thickness):
     model.eval()
     log_envelope = log_residual = log_incident = log_sample_ids = log_theta = None
     with torch.set_grad_enabled(False):
@@ -334,8 +335,7 @@ def valid(valid_loader, model, epoch, loss_valid, device, mode, pml_thickness, l
         loss_valid[epoch-1] = loss_valid[epoch-1] / count
 
     wandb.log({'valid/loss': loss_valid[epoch-1].item(), 'epoch': epoch})
-    if log_freq and epoch % log_freq == 0:
-        log_fields_to_wandb(log_envelope, log_residual, log_incident, log_sample_ids, log_theta, mode, 'valid', epoch)
+    log_fields_to_wandb(log_envelope, log_residual, log_incident, log_sample_ids, log_theta, mode, 'valid', epoch)
 
 
 # Cap how many samples in the logged batch get their own figure, so a

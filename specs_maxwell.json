@@ -20,6 +20,7 @@
   "NumTrainSamples": null,
   "SampleId": null,
   "SampleTheta": null,
+  "ForceValidIds": ["sample_0000"],
   "SkipValid": false,
   "Seed": 2,
   "LearningRate": 0.0005,

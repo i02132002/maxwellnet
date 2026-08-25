@@ -5,6 +5,7 @@ import numpy as np
 import os
 import random
 from datasets import load_dataset
+from tqdm import tqdm
 
 
 class LensDataset(torch.utils.data.Dataset):
@@ -42,14 +43,22 @@ class ShapeDataset(torch.utils.data.Dataset):
             ).select_columns(self._COLUMNS)
         # HF `datasets`' default row access decodes each row's (Ny, Nx, 3)
         # array columns from Arrow into nested Python lists from scratch on
-        # every call (~150ms/row here) -- with persistent_workers=True this
-        # cost is paid every epoch even though the underlying data never
-        # changes. Cache the decoded item per (worker-local) process so only
-        # the first epoch pays it; every later epoch is a plain dict lookup.
-        self._cache = [None] * len(self.dataset)
+        # every call (~150ms/row here). Decoding eagerly here, in the main
+        # process, means every DataLoader worker inherits an already-warm
+        # cache -- PyTorch hands workers the already-constructed dataset
+        # object (via copy-on-write fork, or by pickling the live object for
+        # spawn), it doesn't reconstruct it from scratch per worker. Without
+        # this, a lazy per-`__getitem__` cache only warms up gradually over
+        # many epochs (each worker only sees whichever indices land on it
+        # that epoch's shuffle), and a worker asked for a not-yet-cached
+        # index mid-epoch stalls every other worker behind it in the
+        # strictly-ordered output queue.
+        n = len(self.dataset)
+        self._cache = [self._decode(i) for i in tqdm(range(n), desc="Caching dataset", disable=n == 0)]
 
     @classmethod
-    def load_train_valid(cls, config, mode, valid_fraction=0.1, seed=0, n_samples=None, sample_id=None, theta=None):
+    def load_train_valid(cls, config, mode, valid_fraction=0.1, seed=0, n_samples=None, sample_id=None, theta=None,
+                          force_valid_ids=None):
         """Load the HF dataset filtered to the polarization matching `mode`
         ('te' -> 's', 'tm' -> 'p'), then split into train/valid ShapeDatasets,
         grouped by `sample_id` so rows sharing a sample_id (e.g. its s/p-pol
@@ -68,7 +77,14 @@ class ShapeDataset(torch.utils.data.Dataset):
         first after shuffling. `n_samples`/`valid_fraction` are ignored
         when this is given. `theta`, if also given alongside `sample_id`,
         further restricts to just the row(s) at that incidence angle
-        (degrees) rather than every angle for that sample_id."""
+        (degrees) rather than every angle for that sample_id.
+
+        `force_valid_ids`, if given (a single sample_id string, or a list of
+        them), pins those sample_ids into the valid split unconditionally --
+        they're removed from the shuffle pool entirely so they can never
+        land in train and are always available for a consistent, repeatable
+        held-out check across seeds/runs. Ignored when `sample_id` is given
+        (that path already returns an empty valid split)."""
         pol = 's' if mode == 'te' else 'p'
         raw = load_dataset(
             "als-rixs/latent-image-training", config, split="train", revision="fixed-dimension",
@@ -96,10 +112,15 @@ class ShapeDataset(torch.utils.data.Dataset):
             return cls(hf_dataset=full.select(train_indices)), cls(hf_dataset=full.select([]))
 
         unique_ids = sorted(set(sample_ids))
-        random.Random(seed).shuffle(unique_ids)
+        forced = set()
+        if force_valid_ids is not None:
+            forced = {force_valid_ids} if isinstance(force_valid_ids, str) else set(force_valid_ids)
+        shuffle_pool = [uid for uid in unique_ids if uid not in forced]
+        random.Random(seed).shuffle(shuffle_pool)
         n_valid = round(len(unique_ids) * valid_fraction)
-        valid_ids = set(unique_ids[:n_valid])
-        train_ids = unique_ids[n_valid:]
+        n_valid_from_pool = max(n_valid - len(forced), 0)
+        valid_ids = set(shuffle_pool[:n_valid_from_pool]) | forced
+        train_ids = shuffle_pool[n_valid_from_pool:]
         if n_samples is not None:
             train_ids = train_ids[:n_samples]
         train_ids = set(train_ids)
@@ -114,10 +135,9 @@ class ShapeDataset(torch.utils.data.Dataset):
         return len(self.dataset)
 
     def __getitem__(self, idx):
-        cached = self._cache[idx]
-        if cached is not None:
-            return cached
+        return self._cache[idx]
 
+    def _decode(self, idx):
         r = self.dataset[idx]
 
         optical_constant = (np.asarray(r["optical_constant_real"])
@@ -147,5 +167,4 @@ class ShapeDataset(torch.utils.data.Dataset):
             "delta_x_a": delta_x_a,
             "delta_z_a": delta_z_a,
         }
-        self._cache[idx] = item
         return item
