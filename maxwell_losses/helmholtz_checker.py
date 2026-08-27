@@ -356,6 +356,88 @@ def helmholtz_residual_loss_periodic_pml(
 
         return h + correction
 
+    def _lap_z_transparent(f: Tensor, inc: Tensor, kz_, kx_) -> Tensor:
+        """∂²f/∂z² with an exact transparent (non-reflecting) boundary
+        condition at each z edge, in place of PML. PML's "scattered field
+        -> 0 at the truncation" assumption (via hard zero-padding, see
+        `_lap_z_pml_scattered`) is only valid if the true scattered field
+        actually decays to ~0 near the domain edges -- false whenever the
+        domain contains a persistent background structure (e.g. a
+        thin-film slab) whose own reflection/transmission response doesn't
+        decay, propagating as genuine plane waves all the way to both
+        edges. A transparent BC sidesteps needing to know *why* the field
+        doesn't vanish there at all: it only requires the medium AT each
+        edge to be homogeneous (vacuum, verified empirically for this
+        dataset), which lets the scattered field there be decomposed
+        exactly into discrete Bloch/Rayleigh orders kx_n = kx + 2*pi*n/Lx
+        (via FFT along x, after removing the field's own Bloch phase
+        carrier -- same phase convention `_bloch_pad_x` already corrects
+        for), each independently satisfying kz_n = sqrt(k^2 - kx_n^2)
+        (real: propagating; complex: evanescent). "Transparent" then means:
+        whatever combination of these modes is present at the boundary row
+        continues propagating/decaying straight out of the domain, with
+        nothing reflected back in -- the ghost row p steps beyond an edge
+        is that edge's own boundary-row spectrum times exp(i*kz_n*p*dz)
+        per mode (principal branch, Im(kz_n)>=0, so evanescent modes decay
+        moving away from the domain using this same edge-local rule at
+        *either* edge -- no separate incidence-side/far-side bookkeeping
+        needed, unlike a literal Fresnel-background approach). This is
+        exact given a homogeneous boundary medium, unlike PML's graded
+        approximation, and needs no thickness/order/strength tuning.
+
+        The known incident wave's own z-curvature correction is unchanged
+        from `_lap_z_pml_scattered` (linearity: stencil(scattered) +
+        stencil(incident) == stencil(total), and incident is a single
+        known plane wave -- no Rayleigh decomposition needed for it).
+        Output z-length == f's z-length, same contract as
+        `_lap_z_pml_scattered` -- drop-in replacement."""
+        scattered = f - inc
+        nx = scattered.shape[-1]
+        Lx = nx * dx
+
+        kx_t = torch.as_tensor(kx_, dtype=torch.float32, device=f.device)
+        if kx_t.dim() > 0:
+            kx_t = kx_t.reshape(-1, 1, 1, 1)
+        x_idx = torch.arange(nx, device=f.device, dtype=torch.float32)
+        carrier_angle = kx_t * x_idx * dx
+        carrier = torch.complex(torch.cos(carrier_angle), torch.sin(carrier_angle)).to(f.dtype)
+        s_periodic = scattered * torch.conj(carrier)  # remove Bloch phase -> exactly Lx-periodic
+
+        spectrum = torch.fft.fft(s_periodic, dim=-1)  # (B,1,Nz,Nx) per-mode amplitude, every z row
+        n_idx = torch.fft.fftfreq(nx, d=dx, device=f.device) * 2 * math.pi  # angular 2*pi*n/Lx per bin
+        kx_n = kx_t + n_idx.reshape(1, 1, 1, nx)
+        kz_n = torch.sqrt((k**2 - kx_n**2).to(torch.complex64))  # principal branch, Im>=0
+
+        def _ghost(spectrum_row: Tensor, p: int) -> Tensor:
+            phase = torch.exp(1j * kz_n * p * dz)
+            return torch.fft.ifft(spectrum_row * phase, dim=-1) * carrier
+
+        ghost_top2 = _ghost(spectrum[..., :1, :], 2)
+        ghost_top1 = _ghost(spectrum[..., :1, :], 1)
+        ghost_bot1 = _ghost(spectrum[..., -1:, :], 1)
+        ghost_bot2 = _ghost(spectrum[..., -1:, :], 2)
+        padded = torch.cat(
+            [ghost_top2, ghost_top1, scattered, ghost_bot1, ghost_bot2], dim=-2
+        ).to(f.dtype)
+
+        e = F.conv2d(padded, _kernel_e_z(dz, f.device), padding=0)
+        h = F.conv2d(e, _kernel_h_z(dz, f.device), padding=0)
+
+        kz_t = torch.as_tensor(kz_, dtype=torch.float32, device=f.device)
+        if kz_t.dim() > 0:
+            kz_t = kz_t.reshape(-1, 1, 1, 1)
+        angle = kz_t * dz
+        step = torch.complex(torch.cos(angle), torch.sin(angle)).to(inc.dtype)
+        below2 = inc[..., :1, :] * torch.conj(step) ** 2
+        below1 = inc[..., :1, :] * torch.conj(step)
+        above1 = inc[..., -1:, :] * step
+        above2 = inc[..., -1:, :] * step ** 2
+        inc_padded = torch.cat([below2, below1, inc, above1, above2], dim=-2)
+        e_inc = F.conv2d(inc_padded, _kernel_e_z(dz, f.device), padding=0)
+        correction = F.conv2d(e_inc, _kernel_h_z(dz, f.device), padding=0)
+
+        return h + correction
+
     def _lap_x_periodic(f: Tensor, kx_) -> Tensor:
         """∂²f/∂x² with Bloch-periodic wraparound, output x-length == f's
         x-length."""
@@ -397,7 +479,7 @@ def helmholtz_residual_loss_periodic_pml(
         inc = _ensure_4d(incident.to(torch.complex64))
         Ey  = (1.0 + a_y) * inc
 
-        diff = _lap_z_pml_scattered(Ey, inc, kz) + _lap_x_periodic(Ey, kx) + k**2 * eps * Ey
+        diff = _lap_z_transparent(Ey, inc, kz, kx) + _lap_x_periodic(Ey, kx) + k**2 * eps * Ey
         return diff.squeeze(1) if is_batched else diff.squeeze()
 
     elif mode == 'p':

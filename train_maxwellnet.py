@@ -89,6 +89,7 @@ def main(load_ckpt, reset_lr=False, epochs_override=None, n_samples=None, skip_v
     batch_size = get_spec_with_default(specs, "BatchSize", 1)
     epochs = epochs_override if epochs_override is not None else get_spec_with_default(specs, "Epochs", 1)
     snapshot_freq = specs["SnapshotFrequency"]
+    save_e_field = get_spec_with_default(specs, "SaveEField", True)
 
     checkpoints = list(range(snapshot_freq, epochs + 1, snapshot_freq))
 
@@ -186,12 +187,12 @@ def main(load_ckpt, reset_lr=False, epochs_override=None, n_samples=None, skip_v
 
     for epoch in range(start_epoch + 1, epochs + 1):
         train(train_loader, model, optimizer, epoch, loss_train,
-              device, mode, pml_thickness, log_freq)
+              device, mode, pml_thickness, log_freq, directory, save_e_field)
         logging.info("[Train] {} epoch. Loss: {:.5f}".format(
             epoch, loss_train[epoch-1].item())) if rank == 0 else None
         if perform_valid and log_freq and epoch % log_freq == 0:
             valid(valid_loader, model, epoch, loss_valid,
-                  device, mode, pml_thickness)
+                  device, mode, pml_thickness, directory, save_e_field)
             logging.info("[Valid] {} epoch. Loss: {:.5f}".format(
                 epoch, loss_valid[epoch-1].item())) if rank == 0 else None
 
@@ -269,19 +270,44 @@ def _compute_loss(data, model, device, mode, pml_thickness):
         envelope, epsilon_map, incident, kz, kx, pol, wavelength_a, delta_x_a, delta_z_a, pml_thickness)
 
     loss = torch.mean(residual.abs().pow(2))
-    return loss, envelope, residual, incident
+    return loss, envelope, residual, incident, epsilon_map, kz, kx, wavelength_a, delta_x_a, delta_z_a
 
 
-def train(train_loader, model, optimizer, epoch, loss_train, device, mode, pml_thickness, log_freq):
+# Matches ShapeNet.PeriodicMaxwellNet._EPS_INDEX exactly, so the FEM
+# ground-truth field is selected into the same channel convention/shape
+# that `envelope`/`epsilon_map` already use for the physics residual.
+_E_FIELD_INDEX = {'te': [2], 'tm': [0, 1]}
+
+
+def _fem_residual(e_field, epsilon_map, incident, kz, kx, mode, wavelength_a, delta_x_a, delta_z_a, pml_thickness):
+    """Helmholtz residual of the FEM ground-truth field itself, plugged
+    into the same discrete residual the model is trained against -- an
+    empirical floor on how small |residual|^2 can get on this fixed
+    finite-difference grid, since even the FEM solver's field doesn't
+    exactly satisfy *this* grid's discrete equation (different mesh /
+    discretization from FEM's own)."""
+    pol = 's' if mode == 'te' else 'p'
+    e_sel = e_field[..., _E_FIELD_INDEX[mode]].movedim(-1, 1).to(torch.complex64)  # (B, k, Nz, Nx)
+    if mode == 'te':
+        e_sel = e_sel[:, 0]
+        envelope_gt = e_sel / incident - 1.0
+    else:
+        envelope_gt = e_sel / incident.unsqueeze(1) - 1.0
+    return helmholtz_residual_loss_periodic_pml(
+        envelope_gt, epsilon_map, incident, kz, kx, pol, wavelength_a, delta_x_a, delta_z_a, pml_thickness)
+
+
+def train(train_loader, model, optimizer, epoch, loss_train, device, mode, pml_thickness, log_freq, directory, save_e_field):
     model.train()
     n_batches = len(train_loader)
     log_envelope = log_residual = log_incident = log_e_field = log_sample_ids = log_theta = None
+    log_epsilon_map = log_kz = log_kx = log_wavelength_a = log_delta_x_a = log_delta_z_a = None
     with torch.set_grad_enabled(True):
         count = 0
 
         pbar = tqdm(train_loader, desc=f"Epoch {epoch} [train]", leave=False)
         for batch_idx, data in enumerate(pbar):
-            loss, envelope, residual, incident = _compute_loss(
+            loss, envelope, residual, incident, epsilon_map, kz, kx, wavelength_a, delta_x_a, delta_z_a = _compute_loss(
                 data, model, device, mode, pml_thickness)
 
             optimizer.zero_grad()
@@ -303,24 +329,33 @@ def train(train_loader, model, optimizer, epoch, loss_train, device, mode, pml_t
                 log_e_field = data['e_field'].detach().cpu()
                 log_sample_ids = list(data['sample_id'])
                 log_theta = data['theta'].detach().cpu().tolist()
+                log_epsilon_map = epsilon_map.detach().cpu()
+                log_kz = kz.detach().cpu()
+                log_kx = kx.detach().cpu()
+                log_wavelength_a, log_delta_x_a, log_delta_z_a = wavelength_a, delta_x_a, delta_z_a
 
         loss_train[epoch-1] = loss_train[epoch-1] / count
 
     wandb.log({'train/loss': loss_train[epoch-1].item(), 'epoch': epoch})
     if log_freq and epoch % log_freq == 0:
-        log_fields_to_wandb(log_envelope, log_residual, log_incident, log_e_field,
+        log_residual_gt = _fem_residual(log_e_field, log_epsilon_map, log_incident, log_kz, log_kx, mode,
+                                        log_wavelength_a, log_delta_x_a, log_delta_z_a, pml_thickness)
+        log_fields_to_wandb(log_envelope, log_residual, log_residual_gt, log_incident, log_e_field,
                             log_sample_ids, log_theta, mode, 'train', epoch)
+        if save_e_field:
+            save_e_field_npz(log_envelope, log_incident, log_sample_ids, log_theta, mode, 'train', epoch, directory)
 
 
-def valid(valid_loader, model, epoch, loss_valid, device, mode, pml_thickness):
+def valid(valid_loader, model, epoch, loss_valid, device, mode, pml_thickness, directory, save_e_field):
     model.eval()
     log_envelope = log_residual = log_incident = log_e_field = log_sample_ids = log_theta = None
+    log_epsilon_map = log_kz = log_kx = log_wavelength_a = log_delta_x_a = log_delta_z_a = None
     with torch.set_grad_enabled(False):
         count = 0
 
         pbar = tqdm(valid_loader, desc=f"Epoch {epoch} [valid]", leave=False)
         for batch_idx, data in enumerate(pbar):
-            loss, envelope, residual, incident = _compute_loss(
+            loss, envelope, residual, incident, epsilon_map, kz, kx, wavelength_a, delta_x_a, delta_z_a = _compute_loss(
                 data, model, device, mode, pml_thickness)
 
             loss_valid[epoch-1] += loss.item()
@@ -334,12 +369,20 @@ def valid(valid_loader, model, epoch, loss_valid, device, mode, pml_thickness):
                 log_e_field = data['e_field'].detach().cpu()
                 log_sample_ids = list(data['sample_id'])
                 log_theta = data['theta'].detach().cpu().tolist()
+                log_epsilon_map = epsilon_map.detach().cpu()
+                log_kz = kz.detach().cpu()
+                log_kx = kx.detach().cpu()
+                log_wavelength_a, log_delta_x_a, log_delta_z_a = wavelength_a, delta_x_a, delta_z_a
 
         loss_valid[epoch-1] = loss_valid[epoch-1] / count
 
     wandb.log({'valid/loss': loss_valid[epoch-1].item(), 'epoch': epoch})
-    log_fields_to_wandb(log_envelope, log_residual, log_incident, log_e_field,
+    log_residual_gt = _fem_residual(log_e_field, log_epsilon_map, log_incident, log_kz, log_kx, mode,
+                                    log_wavelength_a, log_delta_x_a, log_delta_z_a, pml_thickness)
+    log_fields_to_wandb(log_envelope, log_residual, log_residual_gt, log_incident, log_e_field,
                         log_sample_ids, log_theta, mode, 'valid', epoch)
+    if save_e_field:
+        save_e_field_npz(log_envelope, log_incident, log_sample_ids, log_theta, mode, 'valid', epoch, directory)
 
 
 # Cap how many samples in the logged batch get their own figure, so a
@@ -365,12 +408,20 @@ def _fft_log_intensity(field_abs):
     return torch.log10(spectrum.abs().pow(2) + 1e-12)
 
 
-def _sample_panels(a, r, inc, e_gt):
-    """The 8 (part, title) panels shown per sample: real/amplitude of the
+def _log_intensity(x):
+    """log10(x + eps), for plotting an always-nonnegative quantity (e.g.
+    |residual|^2) whose dynamic range spans many orders of magnitude."""
+    return torch.log10(x + 1e-12)
+
+
+def _sample_panels(a, r, inc, e_gt, r_gt):
+    """The 9 (part, title) panels shown per sample: real/amplitude of the
     envelope, real/amplitude of the reconstructed total field E_total =
-    incident * (1 + envelope) and its 2D-FFT log intensity, the FEM
-    ground-truth field's amplitude and its 2D-FFT log intensity, and
-    |residual|^2. imaginary(envelope) is deliberately omitted to keep each
+    incident * (1 + envelope) and its 2D-FFT log intensity, log|residual|^2,
+    the FEM ground-truth field's amplitude and its 2D-FFT log intensity,
+    and the FEM field's own log|residual|^2 (an empirical floor -- how far
+    even the "true" field is from exactly satisfying this discrete
+    residual). imaginary(envelope) is deliberately omitted to keep each
     sample's row from growing further."""
     e_total = (1.0 + a) * inc
     e_total_amp = e_total.abs()
@@ -381,17 +432,18 @@ def _sample_panels(a, r, inc, e_gt):
         (e_total.real, 'real(E_total)'),
         (e_total_amp, 'amplitude(E_total)'),
         (_fft_log_intensity(e_total_amp), 'log|FFT(amp(E_total))|^2'),
+        (_log_intensity(r.abs().pow(2)), 'log|residual|^2'),
         (e_gt_amp, 'amplitude(E_field) [FEM]'),
         (_fft_log_intensity(e_gt_amp), 'log|FFT(amp(E_field))|^2 [FEM]'),
-        (r.abs().pow(2), '|residual|^2'),
+        (_log_intensity(r_gt.abs().pow(2)), 'log|residual|^2 [FEM]'),
     ]
 
 
-_PANELS_PER_SAMPLE = 8
+_PANELS_PER_SAMPLE = 9
 
 
-def _plot_angle_group(indices, envelope, residual, incident, e_field, sample_ids, mode):
-    """One figure per incidence angle: one row per sample, each row the 8
+def _plot_angle_group(indices, envelope, residual, residual_gt, incident, e_field, sample_ids, mode):
+    """One figure per incidence angle: one row per sample, each row the 9
     panels from _sample_panels."""
     n_samples = len(indices)
     ncols = _PANELS_PER_SAMPLE
@@ -401,13 +453,13 @@ def _plot_angle_group(indices, envelope, residual, incident, e_field, sample_ids
     for row, i in enumerate(indices):
         e_gt = e_field[i, ..., _E_FIELD_CHANNEL[mode]]
         if mode == 'te':
-            a, r, inc = envelope[i], residual[i], incident[i]
+            a, r, r_gt, inc = envelope[i], residual[i], residual_gt[i], incident[i]
         else:
             # tm: this grid shows the 'z' component only; not the primary
             # use case for this layout, so the 'x' component isn't tiled.
-            a, r, inc = envelope[i, 0], residual[i, 0], incident[i]
+            a, r, r_gt, inc = envelope[i, 0], residual[i, 0], residual_gt[i, 0], incident[i]
 
-        for k, (part, title) in enumerate(_sample_panels(a, r, inc, e_gt)):
+        for k, (part, title) in enumerate(_sample_panels(a, r, inc, e_gt, r_gt)):
             ax = axes[row, k]
             im = ax.imshow(part.numpy(), origin='lower', aspect='equal', cmap='magma')
             ax.set_title(f'{sample_ids[i]}\n{title}', fontsize=8)
@@ -416,7 +468,7 @@ def _plot_angle_group(indices, envelope, residual, incident, e_field, sample_ids
     return fig
 
 
-def log_fields_to_wandb(envelope, residual, incident, e_field, sample_ids, theta, mode, train_valid, epoch):
+def log_fields_to_wandb(envelope, residual, residual_gt, incident, e_field, sample_ids, theta, mode, train_valid, epoch):
     """Group the logged batch (up to MAX_LOGGED_SAMPLES) by incidence
     angle, and produce one combined figure per angle -- rather than one
     figure per sample -- tiling every sample sharing that angle as one row
@@ -428,12 +480,31 @@ def log_fields_to_wandb(envelope, residual, incident, e_field, sample_ids, theta
 
     images = {}
     for angle, indices in angle_groups.items():
-        fig = _plot_angle_group(indices, envelope, residual, incident, e_field, sample_ids, mode)
+        fig = _plot_angle_group(indices, envelope, residual, residual_gt, incident, e_field, sample_ids, mode)
         images[f'{train_valid}/{mode}/envelope_residual_theta{angle:.0f}'] = wandb.Image(fig)
         plt.close(fig)
 
     images['epoch'] = epoch
     wandb.log(images)
+
+
+def save_e_field_npz(envelope, incident, sample_ids, theta, mode, train_valid, epoch, directory):
+    """Save the predicted total complex field E_total = incident * (1 +
+    envelope) for every currently-logged sample (same MAX_LOGGED_SAMPLES cap
+    and cadence as log_fields_to_wandb) to a single .npz per log point,
+    under `directory`/e_field/."""
+    if mode == 'te':
+        e_total = (1.0 + envelope) * incident
+    else:
+        e_total = (1.0 + envelope) * incident.unsqueeze(1)
+
+    n = min(len(sample_ids), MAX_LOGGED_SAMPLES)
+    out_dir = os.path.join(directory, 'e_field')
+    os.makedirs(out_dir, exist_ok=True)
+
+    fields = {f"{sample_ids[i]}_theta{theta[i]:.0f}": e_total[i].numpy() for i in range(n)}
+    path = os.path.join(out_dir, f'{train_valid}_{mode}_epoch{epoch}.npz')
+    np.savez(path, sample_ids=np.array(sample_ids[:n]), theta=np.array(theta[:n]), **fields)
 
 
 def save_checkpoint(state, directory, filename):
