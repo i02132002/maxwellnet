@@ -5,7 +5,6 @@ import numpy as np
 import os
 import random
 from datasets import load_dataset
-from tqdm import tqdm
 
 
 class LensDataset(torch.utils.data.Dataset):
@@ -37,6 +36,14 @@ class ShapeDataset(torch.utils.data.Dataset):
                 'x0_A', 'y0_A', 'z0_A', 'grid_nx', 'grid_ny', 'pol', 'theta',
                 'e_field_real', 'e_field_imag']
 
+    # These four are stored server-side as Arrow `Array3D` (fixed shape
+    # (257, 257, 3), float32) -- set_format below decodes them straight into
+    # torch tensors via pyarrow's native array conversion. The other
+    # (scalar/string) columns in _COLUMNS are left alone by `columns=` and
+    # pass through as plain Python values (output_all_columns=True).
+    _ARRAY_COLUMNS = ['optical_constant_real', 'optical_constant_imag',
+                       'e_field_real', 'e_field_imag']
+
     def __init__(self, config=None, split=None, hf_dataset=None):
         if hf_dataset is not None:
             self.dataset = hf_dataset
@@ -44,20 +51,16 @@ class ShapeDataset(torch.utils.data.Dataset):
             self.dataset = load_dataset(
                 "als-rixs/latent-image-training", config, split=split, revision="fixed-dimension",
             ).select_columns(self._COLUMNS)
-        # HF `datasets`' default row access decodes each row's (Ny, Nx, 3)
-        # array columns from Arrow into nested Python lists from scratch on
-        # every call (~150ms/row here). Decoding eagerly here, in the main
-        # process, means every DataLoader worker inherits an already-warm
-        # cache -- PyTorch hands workers the already-constructed dataset
-        # object (via copy-on-write fork, or by pickling the live object for
-        # spawn), it doesn't reconstruct it from scratch per worker. Without
-        # this, a lazy per-`__getitem__` cache only warms up gradually over
-        # many epochs (each worker only sees whichever indices land on it
-        # that epoch's shuffle), and a worker asked for a not-yet-cached
-        # index mid-epoch stalls every other worker behind it in the
-        # strictly-ordered output queue.
-        n = len(self.dataset)
-        self._cache = [self._decode(i) for i in tqdm(range(n), desc="Caching dataset", disable=n == 0)]
+        # HF `datasets`' default ("python") row format decodes each Array3D
+        # column from Arrow into a nested Python list from scratch on every
+        # call (measured ~60ms/row) before `_decode` can even call
+        # np.asarray on it. `set_format("torch", ...)` instead uses pyarrow's
+        # native array conversion straight into a torch tensor (measured
+        # ~1ms/row, ~60x faster) -- fast enough that the eager whole-dataset
+        # pre-decode cache this line used to build (to keep that ~60ms/row
+        # cost off the DataLoader workers' critical path) is no longer
+        # needed; __getitem__ decodes lazily now.
+        self.dataset.set_format(type="torch", columns=self._ARRAY_COLUMNS, output_all_columns=True)
 
     @classmethod
     def load_train_valid(cls, config, mode, valid_fraction=0.1, seed=0, n_samples=None, sample_id=None, theta=None,
@@ -138,22 +141,17 @@ class ShapeDataset(torch.utils.data.Dataset):
         return len(self.dataset)
 
     def __getitem__(self, idx):
-        return self._cache[idx]
-
-    def _decode(self, idx):
         r = self.dataset[idx]
 
-        optical_constant = (np.asarray(r["optical_constant_real"])
-                            + 1j * np.asarray(r["optical_constant_imag"]))
-        # Crop off the last row/column (e.g. 257x257 -> 256x256) so the grid
-        # size is a clean power of two -- both ShapeNet (UNet pooling) and
-        # helmholtz_checker (periodic-x/PML-z residual) consume this same
-        # cropped array, so they see a consistent grid.
+        optical_constant = torch.complex(r["optical_constant_real"], r["optical_constant_imag"])
+        # Crop off the last row/column (257x257 -> 256x256, this dataset's
+        # native grid) so the grid size is a clean power of two -- both
+        # ShapeNet (UNet pooling) and helmholtz_checker (periodic-x/PML-z
+        # residual) consume this same cropped array, so they see a
+        # consistent grid.
         optical_constant = optical_constant[:-1, :-1, :]
 
-        #optical_constant = 1.0 + 10.0 * np.abs(optical_constant - 1.0)
-
-        e_field = (np.asarray(r["e_field_real"]) + 1j * np.asarray(r["e_field_imag"]))
+        e_field = torch.complex(r["e_field_real"], r["e_field_imag"])
         e_field = e_field[:-1, :-1, :]
 
         delta_x_a = 1.0
@@ -161,8 +159,8 @@ class ShapeDataset(torch.utils.data.Dataset):
 
         item = {
             "sample_id": r["sample_id"],
-            "optical_constant": torch.from_numpy(optical_constant),
-            "e_field": torch.from_numpy(e_field),
+            "optical_constant": optical_constant,
+            "e_field": e_field,
             "wavelength_nm": r["wavelength_nm"],
             "x0_A": r["x0_A"],
             "y0_A": r["y0_A"],
