@@ -5,7 +5,7 @@
 #SBATCH --qos=es2_normal
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=2
+#SBATCH --cpus-per-task=14
 #SBATCH --gres=gpu:H100:1
 #SBATCH --time=1:00:00
 #SBATCH --array=0-0
