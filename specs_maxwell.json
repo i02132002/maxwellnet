@@ -25,7 +25,7 @@
   "Seed": 2,
   "LearningRate": 0.0005,
   "LearningRateDecay": 0.5,
-  "LearningRateDecayStep": 5000,
+  "LearningRateDecayStep": 2000,
   "Epochs": 40000,
   "BatchSize": 16,
   "SnapshotFrequency": 1000,

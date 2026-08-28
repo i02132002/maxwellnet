@@ -13,8 +13,6 @@
 #SBATCH --mail-type=ALL
 #SBATCH --mail-user=fliou@lbl.gov
 
-module load python/3.12
-
 cd "$SLURM_SUBMIT_DIR" || exit 1
 export PYTHONPATH=$(pwd):$PYTHONPATH
 
