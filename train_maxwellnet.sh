@@ -7,7 +7,7 @@
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=14
 #SBATCH --gres=gpu:H100:1
-#SBATCH --time=1:00:00
+#SBATCH --time=3:00:00
 #SBATCH --array=0-0
 #SBATCH --output=slurm-%A_%a.out
 #SBATCH --mail-type=ALL

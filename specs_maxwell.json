@@ -7,7 +7,7 @@
   "NetworkArch": "periodicmaxwellnet",
   "NetworkSpecs": {
     "depth": 5,
-    "filter": 32,
+    "filter": 16,
     "norm": "weight",
     "up_mode": "upconv"
   },

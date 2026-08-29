@@ -76,8 +76,9 @@ def main(load_ckpt, reset_lr=False, epochs_override=None, n_samples=None, skip_v
     model.train()
     model = model.to(device)
 
-    logging.info("Number of network parameters: {}".format(
-        sum(p.data.nelement() for p in model.parameters())))
+    num_parameters = sum(p.data.nelement() for p in model.parameters())
+    print("Number of network parameters: {}".format(num_parameters))
+    logging.info("Number of network parameters: {}".format(num_parameters))
     logging.debug(specs["NetworkSpecs"])
     logging.debug(specs["PhysicalSpecs"])
 
@@ -106,6 +107,7 @@ def main(load_ckpt, reset_lr=False, epochs_override=None, n_samples=None, skip_v
         id=wandb_run_id,
         resume="allow" if wandb_run_id is not None else None,
     )
+    wandb.run.summary["num_parameters"] = num_parameters
     wandb.define_metric("epoch")
     wandb.define_metric("*", step_metric="epoch")
     wandb.define_metric("train_step")
