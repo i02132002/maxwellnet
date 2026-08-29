@@ -51,6 +51,19 @@ def main(load_ckpt, reset_lr=False, epochs_override=None, n_samples=None, skip_v
                            else 'mps' if torch.backends.mps.is_available()
                            else 'cpu')
 
+    # cuDNN's default allow_tf32=True silently drops every nn.Conv2d in this
+    # UNet to ~10-bit-mantissa TF32 on Ampere/Hopper GPUs (e.g. H100) -- but
+    # not on Turing (2080 Ti has no TF32 tensor cores, always true FP32) or
+    # MPS (Apple Silicon, also always FP32). The Helmholtz residual squares a
+    # finite-difference *second derivative* of the field (divided by dz^2),
+    # which amplifies that ~1e-3 relative TF32 error enormously -- inflating
+    # train/valid loss values on an H100 run relative to an identical run on
+    # a 2080 Ti/MacBook, independent of how well the model is actually
+    # training. Forcing full FP32 makes loss magnitudes comparable across
+    # hardware (at some conv throughput cost on Ampere/Hopper).
+    torch.backends.cudnn.allow_tf32 = False
+    torch.backends.cuda.matmul.allow_tf32 = False
+
     logging.info("Experiment description: \n" +
                  ' '.join([str(elem) for elem in specs["Description"]]))
     logging.info("Training with " + str(device))
