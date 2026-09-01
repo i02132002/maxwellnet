@@ -15,6 +15,10 @@
     "mode": "te",
     "pml_thickness": 10
   },
+  "LossSpecs": {
+    "SupervisedCoef": 1.0,
+    "HelmholtzCoef": null
+  },
   "HFConfig": null,
   "ValidFraction": 0.1,
   "NumTrainSamples": null,

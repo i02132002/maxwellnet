@@ -72,6 +72,13 @@ def main(load_ckpt, reset_lr=False, epochs_override=None, n_samples=None, skip_v
     mode = physical_specs['mode']
     pml_thickness = physical_specs['pml_thickness']
 
+    loss_specs = get_spec_with_default(specs, "LossSpecs", {})
+    supervised_coef = get_spec_with_default(loss_specs, "SupervisedCoef", None)
+    helmholtz_coef = get_spec_with_default(loss_specs, "HelmholtzCoef", 1.0)
+    if supervised_coef is None and helmholtz_coef is None:
+        raise ValueError(
+            "At least one of LossSpecs.SupervisedCoef / LossSpecs.HelmholtzCoef must be set (non-null).")
+
     model = PeriodicMaxwellNet(**specs["NetworkSpecs"], mode=mode)
     if torch.cuda.device_count() > 1:
         logging.info("Multiple GPUs: " + str(torch.cuda.device_count()))
@@ -202,12 +209,12 @@ def main(load_ckpt, reset_lr=False, epochs_override=None, n_samples=None, skip_v
 
     for epoch in range(start_epoch + 1, epochs + 1):
         train(train_loader, model, optimizer, epoch, loss_train,
-              device, mode, pml_thickness, log_freq, directory, save_e_field)
+              device, mode, pml_thickness, log_freq, directory, save_e_field, supervised_coef, helmholtz_coef)
         logging.info("[Train] {} epoch. Loss: {:.5f}".format(
             epoch, loss_train[epoch-1].item())) if rank == 0 else None
         if perform_valid and log_freq and epoch % log_freq == 0:
             valid(valid_loader, model, epoch, loss_valid,
-                  device, mode, pml_thickness, directory, save_e_field)
+                  device, mode, pml_thickness, directory, save_e_field, supervised_coef, helmholtz_coef)
             logging.info("[Valid] {} epoch. Loss: {:.5f}".format(
                 epoch, loss_valid[epoch-1].item())) if rank == 0 else None
 
@@ -244,7 +251,33 @@ def main(load_ckpt, reset_lr=False, epochs_override=None, n_samples=None, skip_v
     wandb.finish() if rank == 0 else None
 
 
-def _compute_loss(data, model, device, mode, pml_thickness):
+# Matches ShapeNet.PeriodicMaxwellNet._EPS_INDEX exactly, so the FEM
+# ground-truth field is selected into the same channel convention/shape
+# that `envelope`/`epsilon_map` already use for the physics residual.
+_E_FIELD_INDEX = {'te': [2], 'tm': [0, 1]}
+
+
+def _select_gt_e_field(e_field, mode):
+    """Selects the FEM ground-truth E-field component(s) matching
+    `envelope`'s channel convention/shape: (B, Nz, Nx) complex for 'te',
+    (B, 2, Nz, Nx) complex for 'tm'."""
+    e_sel = e_field[..., _E_FIELD_INDEX[mode]].movedim(-1, 1).to(torch.complex64)  # (B, k, Nz, Nx)
+    if mode == 'te':
+        e_sel = e_sel[:, 0]
+    return e_sel
+
+
+def _predicted_e_field(envelope, incident, mode):
+    """Reconstructs the predicted total complex E-field E_total = incident
+    * (1 + envelope) from the model's predicted envelope, matching the
+    shape/channel convention of _select_gt_e_field."""
+    if mode == 'te':
+        return (1.0 + envelope) * incident
+    else:
+        return (1.0 + envelope) * incident.unsqueeze(1)
+
+
+def _compute_loss(data, model, device, mode, pml_thickness, supervised_coef, helmholtz_coef):
     optical_constant = data['optical_constant'].to(torch.complex64).to(device)
     pol = data['pol'][0]
     # wavelength/grid spacing are the same across a batch (ShapeDataset
@@ -281,17 +314,24 @@ def _compute_loss(data, model, device, mode, pml_thickness):
     kz = kz * wavelength_a_real
     kx = kx * wavelength_a_real
 
+    # Always computed, regardless of helmholtz_coef, since it's also the
+    # diagnostic plotted/logged against the FEM floor in log_fields_to_wandb.
     residual = helmholtz_residual_loss_periodic_pml(
         envelope, epsilon_map, incident, kz, kx, pol, wavelength_a, delta_x_a, delta_z_a, pml_thickness)
 
-    loss = torch.mean(residual.abs().pow(2))
-    return loss, envelope, residual, incident, epsilon_map, kz, kx, wavelength_a, delta_x_a, delta_z_a
+    loss = 0.0
+    supervised_loss = helmholtz_loss = None
+    if supervised_coef is not None:
+        e_field_gt = _select_gt_e_field(data['e_field'].to(device), mode)
+        e_pred = _predicted_e_field(envelope, incident, mode)
+        supervised_loss = torch.mean((e_pred - e_field_gt).abs().pow(2))
+        loss = loss + supervised_coef * supervised_loss
+    if helmholtz_coef is not None:
+        helmholtz_loss = torch.mean(residual.abs().pow(2))
+        loss = loss + helmholtz_coef * helmholtz_loss
 
-
-# Matches ShapeNet.PeriodicMaxwellNet._EPS_INDEX exactly, so the FEM
-# ground-truth field is selected into the same channel convention/shape
-# that `envelope`/`epsilon_map` already use for the physics residual.
-_E_FIELD_INDEX = {'te': [2], 'tm': [0, 1]}
+    return (loss, envelope, residual, incident, epsilon_map, kz, kx, wavelength_a, delta_x_a, delta_z_a,
+            supervised_loss, helmholtz_loss)
 
 
 def _fem_residual(e_field, epsilon_map, incident, kz, kx, mode, wavelength_a, delta_x_a, delta_z_a, pml_thickness):
@@ -302,9 +342,8 @@ def _fem_residual(e_field, epsilon_map, incident, kz, kx, mode, wavelength_a, de
     exactly satisfy *this* grid's discrete equation (different mesh /
     discretization from FEM's own)."""
     pol = 's' if mode == 'te' else 'p'
-    e_sel = e_field[..., _E_FIELD_INDEX[mode]].movedim(-1, 1).to(torch.complex64)  # (B, k, Nz, Nx)
+    e_sel = _select_gt_e_field(e_field, mode)
     if mode == 'te':
-        e_sel = e_sel[:, 0]
         envelope_gt = e_sel / incident - 1.0
     else:
         envelope_gt = e_sel / incident.unsqueeze(1) - 1.0
@@ -312,7 +351,8 @@ def _fem_residual(e_field, epsilon_map, incident, kz, kx, mode, wavelength_a, de
         envelope_gt, epsilon_map, incident, kz, kx, pol, wavelength_a, delta_x_a, delta_z_a, pml_thickness)
 
 
-def train(train_loader, model, optimizer, epoch, loss_train, device, mode, pml_thickness, log_freq, directory, save_e_field):
+def train(train_loader, model, optimizer, epoch, loss_train, device, mode, pml_thickness, log_freq, directory,
+          save_e_field, supervised_coef, helmholtz_coef):
     model.train()
     n_batches = len(train_loader)
     log_envelope = log_residual = log_incident = log_e_field = log_sample_ids = log_theta = None
@@ -322,8 +362,9 @@ def train(train_loader, model, optimizer, epoch, loss_train, device, mode, pml_t
 
         pbar = tqdm(train_loader, desc=f"Epoch {epoch} [train]", leave=False)
         for batch_idx, data in enumerate(pbar):
-            loss, envelope, residual, incident, epsilon_map, kz, kx, wavelength_a, delta_x_a, delta_z_a = _compute_loss(
-                data, model, device, mode, pml_thickness)
+            (loss, envelope, residual, incident, epsilon_map, kz, kx, wavelength_a, delta_x_a, delta_z_a,
+             supervised_loss, helmholtz_loss) = _compute_loss(
+                data, model, device, mode, pml_thickness, supervised_coef, helmholtz_coef)
 
             optimizer.zero_grad()
             loss.backward()
@@ -335,7 +376,12 @@ def train(train_loader, model, optimizer, epoch, loss_train, device, mode, pml_t
             pbar.set_postfix(loss=loss.item(), grad_norm=grad_norm.item())
 
             train_step = (epoch - 1) * n_batches + batch_idx
-            wandb.log({'train/loss_step': loss.item(), 'train/grad_norm': grad_norm.item(), 'train_step': train_step})
+            log_dict = {'train/loss_step': loss.item(), 'train/grad_norm': grad_norm.item(), 'train_step': train_step}
+            if supervised_loss is not None:
+                log_dict['train/loss_supervised_step'] = supervised_loss.item()
+            if helmholtz_loss is not None:
+                log_dict['train/loss_helmholtz_step'] = helmholtz_loss.item()
+            wandb.log(log_dict)
 
             if batch_idx == 0:
                 log_envelope = envelope.detach().cpu()
@@ -361,7 +407,8 @@ def train(train_loader, model, optimizer, epoch, loss_train, device, mode, pml_t
             save_e_field_npz(log_envelope, log_incident, log_sample_ids, log_theta, mode, 'train', epoch, directory)
 
 
-def valid(valid_loader, model, epoch, loss_valid, device, mode, pml_thickness, directory, save_e_field):
+def valid(valid_loader, model, epoch, loss_valid, device, mode, pml_thickness, directory, save_e_field,
+          supervised_coef, helmholtz_coef):
     model.eval()
     log_envelope = log_residual = log_incident = log_e_field = log_sample_ids = log_theta = None
     log_epsilon_map = log_kz = log_kx = log_wavelength_a = log_delta_x_a = log_delta_z_a = None
@@ -370,8 +417,8 @@ def valid(valid_loader, model, epoch, loss_valid, device, mode, pml_thickness, d
 
         pbar = tqdm(valid_loader, desc=f"Epoch {epoch} [valid]", leave=False)
         for batch_idx, data in enumerate(pbar):
-            loss, envelope, residual, incident, epsilon_map, kz, kx, wavelength_a, delta_x_a, delta_z_a = _compute_loss(
-                data, model, device, mode, pml_thickness)
+            loss, envelope, residual, incident, epsilon_map, kz, kx, wavelength_a, delta_x_a, delta_z_a, _, _ = _compute_loss(
+                data, model, device, mode, pml_thickness, supervised_coef, helmholtz_coef)
 
             loss_valid[epoch-1] += loss.item()
             count += 1
@@ -508,10 +555,7 @@ def save_e_field_npz(envelope, incident, sample_ids, theta, mode, train_valid, e
     envelope) for every currently-logged sample (same MAX_LOGGED_SAMPLES cap
     and cadence as log_fields_to_wandb) to a single .npz per log point,
     under `directory`/e_field/."""
-    if mode == 'te':
-        e_total = (1.0 + envelope) * incident
-    else:
-        e_total = (1.0 + envelope) * incident.unsqueeze(1)
+    e_total = _predicted_e_field(envelope, incident, mode)
 
     n = min(len(sample_ids), MAX_LOGGED_SAMPLES)
     out_dir = os.path.join(directory, 'e_field')
