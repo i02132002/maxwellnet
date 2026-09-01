@@ -8,5 +8,6 @@ tensorboard*
 
 test_data/
 test_run1/
+examples/
 
 __pycache__/
