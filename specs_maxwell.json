@@ -1,0 +1,39 @@
+{
+  "Description": [
+    "Smoke test: train PeriodicMaxwellNet against ShapeDataset",
+    "(als-rixs/latent-image-training, s-pol) using the periodic-x/PML-z",
+    "Helmholtz residual loss."
+  ],
+  "NetworkArch": "periodicmaxwellnet",
+  "NetworkSpecs": {
+    "depth": 5,
+    "filter": 16,
+    "norm": "weight",
+    "up_mode": "upconv"
+  },
+  "PhysicalSpecs": {
+    "mode": "te",
+    "pml_thickness": 10
+  },
+  "HFConfig": null,
+  "ValidFraction": 0.1,
+  "NumTrainSamples": null,
+  "SampleId": null,
+  "SampleTheta": null,
+  "ForceValidIds": ["sample_0000"],
+  "SkipValid": false,
+  "Seed": 2,
+  "LearningRate": 0.0005,
+  "LearningRateDecay": 0.5,
+  "LearningRateDecayStep": 2000,
+  "Epochs": 40000,
+  "BatchSize": 16,
+  "SnapshotFrequency": 1000,
+  "SaveEField": false,
+  "WandB": {
+    "Project": "maxwellnet",
+    "Entity": "als-rixs",
+    "Mode": "online",
+    "LogFrequency": 100
+  }
+}

@@ -1,0 +1,797 @@
+"""XRR reflectivity model for the package."""
+
+from __future__ import annotations
+
+import numbers
+from typing import TYPE_CHECKING, Any, Literal
+
+import numpy as np
+from refnx.analysis import Parameters, possibly_create_parameter
+from scipy.interpolate import splev, splrep
+
+from refloxide.pxr.layout import apply_laboratory_scales, reflectivity_for_pol
+from refloxide.pxr.tjf4x4 import uniaxial_reflectivity
+
+if TYPE_CHECKING:
+    from refnx.analysis import Parameter
+
+    from refloxide.pxr.plugin.io import XrayReflectDataset
+    from refloxide.pxr.plugin.structure import Structure
+
+# some definitions for resolution smearing
+_FWHM = 2 * np.sqrt(2 * np.log(2.0))
+
+
+class ReflectModel:
+    r"""
+    Reflectometry model for anisotropic interfaces.
+
+    Parameters
+    ----------
+    structure : anisotropic_structure.PXR_Structure object
+        The interfacial structure.
+    scale : float or refnx.analysis.Parameter, optional
+        scale factor. All model values are multiplied by this value before
+        the background is added. This is turned into a Parameter during the
+        construction of this object.
+    bkg : float or refnx.analysis.Parameter, optional
+        Q-independent constant background added to all model values. This is
+        turned into a Parameter during the construction of this object.
+    name : str, optional
+        Name of the Model
+    dq : float or refnx.analysis.Parameter, optional
+
+        - `dq == 0` then no resolution smearing is employed.
+        - `dq` is a float or refnx.analysis.Parameter
+           a constant dQ/Q resolution smearing is employed.  For 5% resolution
+           smearing supply 5.This value is turned into a Parameter during the
+           construction of this object.
+
+    Notes
+    -----
+    If `x_err` is supplied to the `model` method, dq becomes overriden. that
+    overrides any setting given here.
+
+    Adding q-smearing greatly reduces the current speed of the calculation.
+    Data collected at ALS 11.0.1.2 over the carbon edge likely does not require any
+    q-smearing.
+
+    """
+
+    def __init__(
+        self,
+        structure: Structure,
+        energy: float | None = None,
+        pol: Literal["s", "p", "sp", "ps"] = "s",
+        name: str = "",
+        *,
+        scale_s: float = 1,
+        scale_p: float = 1,
+        bkg: float = 0,
+        dq: float = 0.0,
+        q_offset: float = 0.0,
+        theta_offset_s: float = 0.0,
+        theta_offset_p: float = 0.0,
+        phi: float = 0.0,
+        backend: str = "uni",
+    ) -> None:
+        self.name = name
+        self._parameters: Parameters | None = None
+        self.backend = backend
+        self._energy = energy  # [eV]
+        self._phi = phi
+        self._pol = pol  # Output polarization
+
+        # all reflectometry models have an optional scale factor and background
+        self._scale_s: Parameter = possibly_create_parameter(scale_s, name="scale_s")  # type: ignore
+        self._scale_p: Parameter = possibly_create_parameter(scale_p, name="scale_p")  # type: ignore
+
+        self._bkg: Parameter = possibly_create_parameter(bkg, name="bkg")  # type: ignore
+        self._q_offset: Parameter = possibly_create_parameter(  # type: ignore
+            q_offset, name="q_offset"
+        )
+
+        # New model parameter energy_offset : 10/21/2021
+        self._energy_offset: Parameter = possibly_create_parameter(  # type: ignore
+            0.0, name="energy_offset", vary=False, bounds=(-1, 1)
+        )
+        structure.energy_offset = self._energy_offset
+
+        # we can optimize the resolution (but this is always overridden by
+        # x_err if supplied. There is therefore possibly no dependence on it.
+        self._dq = possibly_create_parameter(dq, name="dq - resolution")
+
+        # New model parameters for theta_offset
+        self._theta_offset_s: Parameter = possibly_create_parameter(  # type: ignore
+            theta_offset_s, name="theta_offset_s"
+        )
+        self._theta_offset_p: Parameter = possibly_create_parameter(  # type: ignore
+            theta_offset_p, name="theta_offset_p"
+        )
+
+        self._structure: Structure | None = None
+        self.structure = structure
+
+    def __call__(self, x, p=None, x_err=None):
+        r"""
+        Calculate the generative model.
+
+        Parameters
+        ----------
+        x : float or np.ndarray
+            q values for the calculation.
+        p : refnx.analysis.Parameters, optional
+            parameters required to calculate the model
+        x_err : np.ndarray
+            dq resolution smearing values for the dataset being considered.
+
+
+        Returns
+        -------
+        reflectivity : np.ndarray
+            Calculated reflectivity
+
+
+        Note:
+        -------
+        Uses the assigned 'Pol' to determine the output state of 's-pol', 'p-pol' or
+        both
+        """
+        return self.model(x, p=p, x_err=x_err)
+
+    def __repr__(self):
+        """Representation of the ReflectModel."""
+        return (
+            f"ReflectModel({self._structure!r}, name={self.name!r},"
+            f" scale=({self._scale_s!r} {self._scale_p}), bkg={self._bkg!r},"
+            f" dq={self._dq!r}"
+            f" q_offset={self._q_offset!r})"
+        )
+
+    @property
+    def dq(self):
+        r"""
+        :class:`refnx.analysis.Parameter`.
+
+            - `dq.value == 0`
+               no resolution smearing is employed.
+            - `dq.value > 0`
+               a constant dQ/Q resolution smearing is employed.  For 5%
+               resolution smearing supply 5. However, if `x_err` is supplied to
+               the `model` method, then that overrides any setting reported
+               here.
+
+        """
+        return self._dq
+
+    @dq.setter
+    def dq(self, value):
+        self._dq.value = value  # type: ignore
+
+    @property
+    def scale_s(self):
+        r"""
+
+        :class:`refnx.analysis.Parameter`.
+
+          - all model values are multiplied by this value before the background is
+          added.
+
+        """
+        return self._scale_s
+
+    @scale_s.setter
+    def scale_s(self, value):
+        self._scale_s.value = value  # type: ignore
+
+    @property
+    def scale_p(self):
+        r"""
+
+        :class:`refnx.analysis.Parameter`.
+
+          - all model values are multiplied by this value before the background is
+          added.
+
+        """
+        return self._scale_p
+
+    @scale_p.setter
+    def scale_p(self, value):
+        self._scale_p.value = value  # type: ignore
+
+    @property
+    def bkg(self):
+        r"""
+        :class:`refnx.analysis.Parameter`.
+
+          - linear background added to all model values.
+        """
+        return self._bkg
+
+    @bkg.setter
+    def bkg(self, value):
+        self._bkg.value = value  # type: ignore
+
+    @property
+    def q_offset(self):
+        r"""
+        :class:`refnx.analysis.Parameter`.
+
+          - offset in q-vector due to experimental error
+        """
+        return self._q_offset
+
+    @q_offset.setter
+    def q_offset(self, value):
+        self._q_offset.value = value  # type: ignore
+
+    @property
+    def theta_offset_s(self):
+        r"""
+        :class:`refnx.analysis.Parameter`.
+
+          - offset in theta for s-polarization due to experimental error
+        """
+        return self._theta_offset_s
+
+    @theta_offset_s.setter
+    def theta_offset_s(self, value):
+        self._theta_offset_s.value = value  # type: ignore
+
+    @property
+    def theta_offset_p(self):
+        r"""
+        :class:`refnx.analysis.Parameter`.
+
+          - offset in theta for p-polarization due to experimental error
+        """
+        return self._theta_offset_p
+
+    @theta_offset_p.setter
+    def theta_offset_p(self, value):
+        self._theta_offset_p.value = value  # type: ignore
+
+    @property
+    def energy_offset(self) -> Parameter:
+        r"""
+        :class:`refnx.analysis.Parameter`.
+
+        - offset in q-vector due to experimental error
+
+        """
+        return self._energy_offset
+
+    @energy_offset.setter
+    def energy_offset(self, value: float) -> None:
+        self._energy_offset.value = value
+        if self._structure is not None:
+            self._structure.energy_offset = self._energy_offset
+
+    @property
+    def energy(self):
+        """
+        Photon energy to evaluate the resonant reflectivity.
+
+        Automatically updates all PXR_MaterialSLD objects associated with
+        self.structure.
+
+        Returns
+        -------
+            energy : float
+                Photon energy of X-ray probe.
+        """
+        return self._energy
+
+    @energy.setter
+    def energy(self, energy):
+        self._energy = energy
+
+    @property
+    def pol(self):
+        """
+        Polarization to calculate the resonant reflectivity.
+
+            -`pol == 's'`
+            Calculation returns s-polarization only.
+            -`pol == 'p'`
+            Calculation returns p-polarization only.
+            -`pol == 'sp' or 'ps'`
+            Calulation returns concatenate in order of input.
+
+        Returns
+        -------
+            pol : str
+                Linear polarizations state of incident raw
+        """
+        return self._pol
+
+    @pol.setter
+    def pol(self, pol):
+        self._pol = pol
+
+    @property
+    def phi(self):
+        """
+        Azimuthal angle of incidence [deg]. Only used with a biaxial calculation.
+
+        Returns
+        -------
+            phi : float
+                Azimuthal angle of incidence used in calculation.
+        """
+        return self._phi
+
+    @phi.setter
+    def phi(self, phi) -> None:
+        self._phi = phi
+
+    def _model(self, x, p=None, x_err=None):
+        """
+        Calculate the reflectivity model internals.
+
+        This internal method handles parameter updates, q-vector adjustments,
+        and theta offset corrections before calculating reflectivity.
+
+        Parameters
+        ----------
+        x : np.ndarray
+            q values for the calculation.
+        p : refnx.analysis.Parameters, optional
+            parameters required to calculate the model
+        x_err : np.ndarray or float
+            dq resolution smearing values for the dataset being considered.
+
+        Returns
+        -------
+        tuple
+            (qvals, qvals_1, qvals_2, refl, tran, components)
+            - qvals: q values used for calculation
+            - qvals_1, qvals_2: q values for first and second polarization
+            - refl: reflectivity matrix
+            - tran: transmission matrix
+            - components: additional calculation components
+        """
+        # Update parameters if provided
+        if p is not None:
+            self.parameters.pvals = np.array(p)  # type: ignore
+
+        # Use object's dq if x_err is not provided
+        if x_err is None:
+            x_err = float(self.dq)
+
+        # Prepare common model parameters
+        model_input = {
+            "slabs": self.structure.slabs(),  # type: ignore
+            "tensor": self.structure.tensor(energy=self.energy),  # type: ignore
+            "energy": self.energy,
+            "phi": self.phi,
+            "scale_s": self.scale_s.value,  # type: ignore
+            "scale_p": self.scale_p.value,  # type: ignore
+            "bkg": self.bkg.value,  # type: ignore
+            "dq": x_err,
+            "backend": self.backend,
+        }
+
+        # Wavelength in Angstroms
+        wavelength = 12398.42 / self.energy  # type: ignore
+
+        # Handle polarization-specific adjustments
+        if self.pol in ("sp", "ps"):
+            # Find where q values split by detecting largest gap
+            concat_loc = np.argmax(np.abs(np.diff(x)))
+            qvals_1 = x[: concat_loc + 1]
+            qvals_2 = x[concat_loc + 1 :]
+            num_q = max(
+                len(x),
+                concat_loc + 50,  # type: ignore
+            )  # Ensure sufficient points for interpolation
+
+            # Convert q to theta (in degrees)
+            theta_s = np.arcsin(qvals_1 * wavelength / (4 * np.pi)) * 180 / np.pi
+            theta_p = np.arcsin(qvals_2 * wavelength / (4 * np.pi)) * 180 / np.pi
+
+            # Apply polarization-specific angle offsets
+            theta_s += self.theta_offset_s.value  # type: ignore
+            theta_p += self.theta_offset_p.value  # type: ignore
+
+            # Convert back to q
+            qvals_1 = (4 * np.pi / wavelength) * np.sin(theta_s * np.pi / 180)
+            qvals_2 = (4 * np.pi / wavelength) * np.sin(theta_p * np.pi / 180)
+
+            # Create array for calculation and output
+            x = np.concatenate([qvals_1, qvals_2])
+            qvals = np.linspace(np.min(x), np.max(x), num_q)
+
+        elif self.pol == "s":
+            # Convert to theta, apply s-polarization offset, convert back to q
+            theta = np.arcsin(x * wavelength / (4 * np.pi)) * 180 / np.pi
+            theta += self.theta_offset_s.value  # type: ignore
+            qvals = (4 * np.pi / wavelength) * np.sin(theta * np.pi / 180)
+            qvals_1 = qvals_2 = qvals
+
+        elif self.pol == "p":
+            # Convert to theta, apply p-polarization offset, convert back to q
+            theta = np.arcsin(x * wavelength / (4 * np.pi)) * 180 / np.pi
+            theta += self.theta_offset_p.value  # type: ignore
+            qvals = (4 * np.pi / wavelength) * np.sin(theta * np.pi / 180)
+            qvals_1 = qvals_2 = qvals
+
+        else:
+            # No polarization specified, use raw q values
+            qvals = qvals_1 = qvals_2 = x
+
+        # Apply q offset and calculate reflectivity
+        refl, tran, *components = reflectivity(  # type: ignore
+            qvals + self.q_offset.value,  # type: ignore
+            **model_input,  # type: ignore
+        )
+
+        return qvals, qvals_1, qvals_2, refl, tran, components
+
+    def model(self, x, p=None, x_err=None):
+        r"""
+        Calculate the reflectivity of this model.
+
+        Parameters
+        ----------
+        x : float or np.ndarray
+            q or E values for the calculation.
+            specifiy self.qval to be any value to fit energy-space
+        p : refnx.analysis.Parameters, optional
+            parameters required to calculate the model
+        x_err : np.ndarray
+            dq resolution smearing values for the dataset being considered.
+
+        Returns
+        -------
+        reflectivity : np.ndarray
+            Calculated reflectivity. Output is dependent on `self.pol`
+
+        """
+        qvals, qvals_1, qvals_2, refl, _tran, _components = self._model(x, p, x_err)
+        return reflectivity_for_pol(self.pol, refl, qvals, qvals_1, qvals_2)
+
+    def anisotropy(self, x, p=None, x_err=None):  # noqa: ARG002
+        """
+        Calculate the anisotropy of the model.
+
+        Properly accounts for theta offsets between s and p polarizations.
+        """
+        # Wavelength in Angstroms
+        wavelength = 12398.42 / self.energy  # type: ignore
+
+        # Convert x (q) to theta (in degrees)
+        theta = np.arcsin(x * wavelength / (4 * np.pi)) * 180 / np.pi
+
+        # Apply polarization-specific angle offsets
+        theta_s = theta + self.theta_offset_s.value  # type: ignore
+        theta_p = theta + self.theta_offset_p.value  # type: ignore
+
+        # Convert back to q
+        q_s = (4 * np.pi / wavelength) * np.sin(theta_s * np.pi / 180)
+        q_p = (4 * np.pi / wavelength) * np.sin(theta_p * np.pi / 180)
+
+        # Calculate reflectivity for both polarizations with their respective offsets
+        old_pol = self.pol  # Save current polarization setting
+
+        # Calculate s-polarization
+        self.pol = "s"
+        r_s = self.model(q_s, p)
+
+        # Calculate p-polarization
+        self.pol = "p"
+        r_p = self.model(q_p, p)
+
+        # Restore original polarization
+        self.pol = old_pol
+
+        # Calculate anisotropy
+        anisotropy = (r_p - r_s) / (r_p + r_s)
+
+        return anisotropy
+
+    def logp(self):
+        r"""
+        Additional log-probability terms for the reflectivity model.
+
+        Do not
+        include log-probability terms for model parameters, these are
+        automatically included elsewhere.
+
+        Returns
+        -------
+        logp : float
+            log-probability of structure.
+
+        """
+        return self.structure.logp()  # type: ignore
+
+    @property
+    def structure(self):
+        r"""
+        :class:`PRSoXR.PXR_Structure`.
+
+           - object describing the interface of a reflectometry sample.
+        """
+        return self._structure
+
+    @structure.setter
+    def structure(self, structure) -> None:
+        self._structure = structure
+        if self._structure is not None:
+            self._structure.energy_offset = self._energy_offset
+        p = Parameters(name="instrument parameters")
+        p.extend(
+            [
+                self.scale_s,
+                self.scale_p,
+                self.bkg,
+                self.dq,
+                self.q_offset,
+                self.energy_offset,
+                self.theta_offset_s,
+                self.theta_offset_p,
+            ]
+        )
+
+        self._parameters = Parameters(name=self.name)
+        self._parameters.extend([p, structure.parameters])
+
+    @property
+    def parameters(self):
+        r"""
+        :class:`refnx.analysis.Parameters`.
+
+           - parameters associated with this model.
+        """
+        self.structure = self._structure
+        return self._parameters
+
+    @classmethod
+    def build_model(
+        cls, energy: float, structure: Structure, data: XrayReflectDataset, *, name=""
+    ) -> ReflectModel:
+        """
+        Defualt model builder.
+
+        Parameters
+        ----------
+        energy : float
+            Photon energy to evaluate the resonant reflectivity.
+        structure : Structure
+            The interfacial structure.
+        data : XrayReflectDataset
+            The dataset to fit the model to.
+
+        Returns
+        -------
+        ReflectModel
+            A ReflectModel instance with the specified energy and structure.
+        """
+        model = cls(
+            structure,
+            pol="sp",
+            energy=energy,
+            name=f"{name}_{energy}",
+            theta_offset_s=1e-3,
+            theta_offset_p=1e-3,
+            scale_p=1.0,
+            scale_s=1.0,
+        )
+        model._theta_offset_s.setp(vary=True, bounds=(-0.8, 0.8))
+        model._theta_offset_p.setp(vary=True, bounds=(-0.8, 0.8))
+        model._scale_s.setp(vary=True, bounds=(0.6, 1.4))
+        model._scale_p.setp(vary=True, bounds=(0.6, 1.4))
+        model._bkg.value = data.p.y.min()
+        return model
+
+
+def reflectivity(
+    q: np.ndarray,
+    slabs: np.ndarray,
+    tensor: np.ndarray,
+    energy: float = 250.0,
+    phi: float = 0,
+    scale_s: float = 1.0,
+    scale_p: float = 1.0,
+    bkg: float = 0.0,
+    dq: float = 0.0,
+    backend: Literal["uni", "bi"] = "uni",
+) -> tuple[np.ndarray, np.ndarray, list[Any]] | None:
+    r"""
+    Full calculation for anisotropic reflectivity of a stratified medium.
+
+    Parameters
+    ----------
+     q : np.ndarray
+         The qvalues required for the calculation.
+         :math:`Q=\frac{4Pi}{\lambda}\sin(\Omega)`.
+         Units = Angstrom**-1
+     slabs : np.ndarray
+         coefficients required for the calculation, has shape (2 + N, 4),
+         where N is the number of layers
+
+         - slabs[0, 0]
+            ignored
+         - slabs[N, 0]
+            thickness of layer N
+         - slabs[N+1, 0]
+            ignored
+
+         - slabs[0, 1]
+            trace of real index tensor of fronting (/1e-6 Angstrom**-2)
+         - slabs[N, 1]
+            trace of real index tensor of layer N (/1e-6 Angstrom**-2)
+         - slabs[-1, 1]
+            trace of real index tensor of backing (/1e-6 Angstrom**-2)
+
+         - slabs[0, 2]
+            trace of imaginary index tensor of fronting (/1e-6 Angstrom**-2)
+         - slabs[N, 2]
+            trace of imaginary index tensor of layer N (/1e-6 Angstrom**-2)
+         - slabs[-1, 2]
+            trace of imaginary index tensor of backing (/1e-6 Angstrom**-2)
+
+         - slabs[0, 3]
+            ignored
+         - slabs[N, 3]
+            roughness between layer N-1/N
+         - slabs[-1, 3]
+            roughness between backing and layer N
+
+     tensor : 3x3 numpy array
+         The full dielectric tensor required for the anisotropic calculation.
+         Each component (real and imaginary) is a fit parameter
+         Has shape (2 + N, 3, 3)
+         units - unitless
+
+     energy : float
+         Energy to calculate the reflectivity profile
+         Used in calculating 'q' and index of refraction for PXR_MaterialSLD objects
+
+     phi : float
+         Azimuthal angle of incidence for calculating k-vectors.
+         This is only required if dealing with a biaxial tensor
+         defaults to phi = 0 ~
+
+     scale : float
+         scale factor. All model values are multiplied by this value before
+         the background is added
+
+     bkg : float
+         Q-independent constant background added to all model values.
+
+     dq : float or np.ndarray, optional
+         - `dq == 0`
+            no resolution smearing is employed.
+         - `dq` is a float
+            a constant dQ/Q resolution smearing is employed.  For 5% resolution
+            smearing supply 5.
+
+    backend : str ('uni' or 'bi')
+         Calculation symmetry to be applied. 'uni' for a uniaxial approximation
+         (~10x increase in speed). 'bi' for full biaxial calculation.
+
+    Example
+    -------
+
+    from refnx.reflect import reflectivity
+    ```python
+    q = np.linspace(0.01, 0.5, 1000)
+    slabs = np.array(
+        [
+            [0, 2.07, 0, 0],
+            [100, 3.47, 0, 3],
+            [500, -0.5, 0.00001, 3],
+            [0, 6.36, 0, 3],
+        ]
+    )
+    print(reflectivity(q, slabs))
+    ```
+    """
+    # constant dq/q smearing
+    if isinstance(dq, numbers.Real):
+        if float(dq) == 0:
+            if backend == "uni":
+                refl, tran, *components = uniaxial_reflectivity(
+                    q, slabs, tensor, energy
+                )
+            else:
+                refl, tran, *components = uniaxial_reflectivity(
+                    q,
+                    slabs,
+                    tensor,
+                    energy,
+                    phi,  # type: ignore
+                )
+            refl = np.asarray(refl, dtype=np.float64)
+            apply_laboratory_scales(refl, scale_s, scale_p)
+            return (refl + bkg), tran, components
+        else:
+            smear_refl, smear_tran, *components = _smeared_reflectivity(
+                q, slabs, tensor, energy, phi, dq, backend=backend
+            )
+            apply_laboratory_scales(smear_refl, scale_s, scale_p)
+            return (smear_refl + bkg), smear_tran, components
+
+    return None
+
+
+def _smeared_reflectivity(q, w, tensor, energy, phi, resolution, backend="uni"):
+    """
+    Fast resolution smearing for constant dQ/Q.
+
+    Parameters
+    ----------
+    q: np.ndarray
+        Q values to evaluate the reflectivity at
+    w: np.ndarray
+        Parameters for the reflectivity model
+    resolution: float
+        Percentage dq/q resolution. dq specified as FWHM of a resolution
+        kernel.
+
+    Returns
+    -------
+    reflectivity: np.ndarray, np.ndarray, np.ndarray,
+    """
+    if resolution < 0.5:
+        if backend == "uni":
+            refl, tran, *components = uniaxial_reflectivity(q, w, tensor, energy)
+        else:
+            refl, tran, *components = uniaxial_reflectivity(q, w, tensor, energy, phi)  # type: ignore
+        refl = np.asarray(refl, dtype=np.float64)
+        return refl, tran, components
+
+    resolution /= 100
+    gaussnum = 51
+    gaussgpoint = (gaussnum - 1) / 2
+
+    def gauss(x, s):
+        return 1.0 / s / np.sqrt(2 * np.pi) * np.exp(-0.5 * x**2 / s / s)
+
+    lowq = np.min(q)
+    highq = np.max(q)
+    if lowq <= 0:
+        lowq = 1e-6
+
+    start = np.log10(lowq) - 6 * resolution / _FWHM
+    finish = np.log10(highq * (1 + 6 * resolution / _FWHM))
+    interpnum = np.round(
+        np.abs(1 * (np.abs(start - finish)) / (1.7 * resolution / _FWHM / gaussgpoint))
+    )
+    xtemp = np.linspace(start, finish, int(interpnum))
+    xlin = np.power(10.0, xtemp)
+
+    # resolution smear over [-4 sigma, 4 sigma]
+    gauss_x = np.linspace(-1.7 * resolution, 1.7 * resolution, gaussnum)
+    gauss_y = gauss(gauss_x, resolution / _FWHM)
+    if backend == "uni":
+        refl, tran, *components = uniaxial_reflectivity(xlin, w, tensor, energy)
+    else:
+        refl, tran, *components = uniaxial_reflectivity(xlin, w, tensor, energy)
+    refl = np.asarray(refl, dtype=np.float64)
+    step = gauss_x[1] - gauss_x[0]
+    smeared_ss = np.convolve(refl[:, 0, 0], gauss_y, mode="same") * step  # type: ignore
+    smeared_pp = np.convolve(refl[:, 1, 1], gauss_y, mode="same") * step  # type: ignore
+    smeared_sp = np.convolve(refl[:, 0, 1], gauss_y, mode="same") * step  # type: ignore
+    smeared_ps = np.convolve(refl[:, 1, 0], gauss_y, mode="same") * step  # type: ignore
+
+    smeared_output_ss = splev(q, splrep(xlin, smeared_ss))
+    smeared_output_sp = splev(q, splrep(xlin, smeared_sp))
+    smeared_output_ps = splev(q, splrep(xlin, smeared_ps))
+    smeared_output_pp = splev(q, splrep(xlin, smeared_pp))
+
+    smeared_output = np.rollaxis(
+        np.array(
+            [
+                [smeared_output_ss, smeared_output_sp],
+                [smeared_output_ps, smeared_output_pp],
+            ]
+        ),
+        2,
+        0,
+    )
+
+    return smeared_output, tran, components

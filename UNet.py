@@ -30,10 +30,21 @@ SOFTWARE.
 
 import torch
 from torch import nn
+import torch.nn.functional as F
+
+
+class CircularXReplicateZPad2d(nn.Module):
+    """Pads 1 pixel circular (periodic) along x (width) and 1 pixel
+    replicate along z (height, the second-to-last dim)."""
+
+    def forward(self, x):
+        x = F.pad(x, (1, 1, 0, 0), mode='circular')
+        x = F.pad(x, (0, 0, 1, 1), mode='replicate')
+        return x
 
 
 class UNet(nn.Module):
-    def __init__(self, in_channels=1, out_channels=2, depth=5, wf=6, norm='weight', up_mode='upconv'):
+    def __init__(self, in_channels=1, out_channels=2, depth=5, wf=6, norm='weight', up_mode='upconv', cond_channels=0):
         super(UNet, self).__init__()
         assert up_mode in ('upconv', 'upsample')
         self.down_path = nn.ModuleList()
@@ -53,7 +64,7 @@ class UNet(nn.Module):
                 self.down_path.append(nn.AvgPool2d(2))
             else:
                 self.down_path.append(UNetConvBlock(
-                    prev_channels, [wf * (2 ** i), wf * (2 ** (i - 1))], 3, 0, norm))
+                    prev_channels + cond_channels, [wf * (2 ** i), wf * (2 ** (i - 1))], 3, 0, norm))
                 prev_channels = int(wf * (2 ** (i - 1)))
 
         for i in reversed(range(depth - 1)):
@@ -64,12 +75,16 @@ class UNet(nn.Module):
         self.last_conv = nn.Conv2d(
             prev_channels, out_channels, kernel_size=1, padding=0, bias=False)
 
-    def forward(self, scat_pot):
+    def forward(self, scat_pot, cond=None):
         blocks = []
         x = scat_pot
+        n = len(self.down_path)
         for i, down in enumerate(self.down_path):
+            if i == n - 1 and cond is not None:
+                cond_map = cond[:, :, None, None].expand(-1, -1, x.shape[-2], x.shape[-1])
+                x = torch.cat([x, cond_map], dim=1)
             x = down(x)
-            if i % 2 == 0 and i != (len(self.down_path) - 1):
+            if i % 2 == 0 and i != (n - 1):
                 blocks.append(x)
         for i, up in enumerate(self.up_path):
             x = up(x, blocks[-i - 1])
@@ -82,11 +97,11 @@ class UNetConvBlock(nn.Module):
         super(UNetConvBlock, self).__init__()
         block = []
         if norm == 'weight':
-            block.append(nn.ReplicationPad2d(1))
+            block.append(CircularXReplicateZPad2d())
             block.append(nn.utils.weight_norm((nn.Conv2d(in_size, out_size[0], kernel_size=int(kersize),
                                                          padding=int(0), bias=True)), name='weight'))
             block.append(nn.CELU())
-            block.append(nn.ReplicationPad2d(1))
+            block.append(CircularXReplicateZPad2d())
             block.append(nn.utils.weight_norm((nn.Conv2d(out_size[0], out_size[1], kernel_size=int(kersize),
                                                          padding=int(0), bias=True)), name='weight'))
         elif norm == 'batch':
@@ -102,11 +117,11 @@ class UNetConvBlock(nn.Module):
             block.append(nn.BatchNorm2d(out_size[1]))
 
         elif norm == 'no':
-            block.append(nn.ReplicationPad2d(1))
+            block.append(CircularXReplicateZPad2d())
             block.append((nn.Conv2d(in_size, out_size[0], kernel_size=int(kersize),
                                     padding=int(0), bias=True)))
             block.append(nn.CELU())
-            block.append(nn.ReplicationPad2d(1))
+            block.append(CircularXReplicateZPad2d())
             block.append((nn.Conv2d(out_size[0], out_size[1], kernel_size=int(kersize),
                                     padding=int(0), bias=True)))
 
