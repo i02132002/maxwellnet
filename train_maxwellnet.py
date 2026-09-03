@@ -3,6 +3,7 @@
 import torch
 from Dataset import ShapeDataset
 from ShapeNet import PeriodicMaxwellNet
+from Swin import SwinMaxwellNet
 from maxwell_losses.helmholtz_checker import helmholtz_residual_loss_periodic_pml
 import torch.backends.cudnn as cudnn
 from torch.optim.lr_scheduler import StepLR
@@ -79,7 +80,12 @@ def main(load_ckpt, reset_lr=False, epochs_override=None, n_samples=None, skip_v
         raise ValueError(
             "At least one of LossSpecs.SupervisedCoef / LossSpecs.HelmholtzCoef must be set (non-null).")
 
-    model = PeriodicMaxwellNet(**specs["NetworkSpecs"], mode=mode)
+    network_arch = get_spec_with_default(specs, "NetworkArch", "maxwellnet")
+    model_cls = {"maxwellnet": PeriodicMaxwellNet, "swin": SwinMaxwellNet}.get(network_arch)
+    if model_cls is None:
+        raise ValueError(
+            f"NetworkArch must be one of 'maxwellnet'/'swin', got {network_arch!r}")
+    model = model_cls(**specs["NetworkSpecs"], mode=mode)
     if torch.cuda.device_count() > 1:
         logging.info("Multiple GPUs: " + str(torch.cuda.device_count()))
     if load_ckpt is not None:

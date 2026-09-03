@@ -4,7 +4,7 @@
     "(als-rixs/latent-image-training, s-pol) using the periodic-x/PML-z",
     "Helmholtz residual loss."
   ],
-  "NetworkArch": "periodicmaxwellnet",
+  "NetworkArch": "maxwellnet",
   "NetworkSpecs": {
     "depth": 4,
     "filter": 8,
