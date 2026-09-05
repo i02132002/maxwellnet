@@ -113,12 +113,20 @@ class WindowAttention(nn.Module):
 
 class SwinBlock(nn.Module):
     """One pre-norm Swin transformer block: (shifted) window attention +
-    residual, then an MLP + residual."""
+    residual, then an MLP + residual.
+
+    Optional residual-stream recording: set ``stream_hook`` to a callable
+    ``hook(block, tag, tokens, H, W)`` where ``tokens`` is the residual
+    stream state ``(B, H*W, C)`` immediately after each residual add
+    (``tag`` is ``\"post_attn\"`` or ``\"post_mlp\"``). Used for
+    registers-style token-norm analysis without changing the forward math.
+    """
 
     def __init__(self, dim, num_heads, window_size, shift_size, mlp_ratio=4.0):
         super().__init__()
         self.window_size = window_size
         self.shift_size = shift_size
+        self.stream_hook = None
 
         self.norm1 = nn.LayerNorm(dim)
         self.attn = WindowAttention(dim, window_size, num_heads)
@@ -146,7 +154,11 @@ class SwinBlock(nn.Module):
             x = torch.roll(x, shifts=(self.shift_size, self.shift_size), dims=(1, 2))
 
         x = shortcut + x.view(B, L, C)
+        if self.stream_hook is not None:
+            self.stream_hook(self, "post_attn", x, H, W)
         x = x + self.mlp(self.norm2(x))
+        if self.stream_hook is not None:
+            self.stream_hook(self, "post_mlp", x, H, W)
         return x
 
 

@@ -1,0 +1,43 @@
+{
+  "Seed": 2,
+  "WandB": {
+    "Mode": "online",
+    "Entity": "als-rixs",
+    "Project": "maxwellnet",
+    "LogFrequency": 1000
+  },
+  "Epochs": 40000,
+  "HFConfig": null,
+  "SampleId": "sample_0000",
+  "BatchSize": 16,
+  "SkipValid": false,
+  "SaveEField": true,
+  "Description": [
+    "Smoke test: train PeriodicMaxwellNet against ShapeDataset",
+    "(als-rixs/latent-image-training, s-pol) using the periodic-x/PML-z",
+    "Helmholtz residual loss."
+  ],
+  "NetworkArch": "periodicmaxwellnet",
+  "SampleTheta": null,
+  "LearningRate": 0.0005,
+  "NetworkSpecs": {
+    "norm": "weight",
+    "depth": 5,
+    "filter": 32,
+    "up_mode": "upconv"
+  },
+  "ForceValidIds": null,
+  "PhysicalSpecs": {
+    "mode": "te",
+    "pml_thickness": 10
+  },
+  "ValidFraction": 0.1,
+  "NumTrainSamples": 1,
+  "LearningRateDecay": 0.5,
+  "SnapshotFrequency": 1000,
+  "LearningRateDecayStep": 5000,
+  "_wandb_name": "maxwellnet_te",
+  "_wandb_state": "finished",
+  "_wandb_url": "https://wandb.ai/als-rixs/maxwellnet/runs/rx9tbiai",
+  "_wandb_id": "rx9tbiai"
+}

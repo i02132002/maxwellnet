@@ -1,25 +1,35 @@
-[tool.poetry]
+[project]
 name = "maxwellnet"
 version = "0.1.0"
 description = ""
-authors = ["Your Name <you@example.com>"]
+authors = [{ name = "Your Name", email = "you@example.com" }]
+requires-python = ">=3.12,<3.13"
 readme = "README.md"
-packages = [{include = "maxwellnet"}]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+]
+dependencies = [
+    "torch>=2.6.0,<3",
+    "numpy<2.0.0",
+    "torchvision>=0.15.0",
+    "scikit-image>=0.24.0",
+    "jupyter>=1.0.0",
+    "matplotlib>=3.10.0",
+    "plyfile>=0.7.4",
+    "periodictable>=2.1.0,<3.0.0",
+    "datasets>=5.0.0,<6",
+    "wandb>=0.28.2,<0.29",
+    "tqdm>=4.70.0,<5",
+]
 
-[tool.poetry.dependencies]
-python = ">=3.12,<3.13"
-torch = "^2.6.0"
-numpy = "<2.0.0"
-torchvision = ">=0.15.0"
-scikit-image = ">=0.24.0"
-jupyter = ">=1.0.0"
-matplotlib = ">=3.10.0"
-plyfile = ">=0.7.4"
-periodictable = ">=2.1.0,<3.0.0"
-datasets = "^5.0.0"
-wandb = "^0.28.2"
-tqdm = "^4.70.0"
+[tool.uv]
+
+[tool.uv.build-backend]
+module-name = ["maxwellnet"]
+module-root = ""
+namespace = true
 
 [build-system]
-requires = ["poetry-core"]
-build-backend = "poetry.core.masonry.api"
+requires = ["uv_build>=0.12.6,<0.13.0"]
+build-backend = "uv_build"
