@@ -1,111 +1,29 @@
-"""Discrete Helmholtz residuals for MaxwellNet-style staggered finite differences.
-
-This module scores ``∇²E + k² ε E`` on complex fields using the same Yee-style
-staggered first-derivative composition as training (orders 2, 4, and 6 on TE).
-It owns interior residuals, periodic-x / transparent-z residuals with PML, and
-a plane-wave Laplacian validator. It does not own network training, FEM
-solvers, or dataset I/O.
-
-Collaborators must keep kernel taps, pad widths, and Bloch/transparent ghosts
-consistent with the chosen ``fd_order``. p-pol mixed derivatives remain
-second-order only.
-"""
-
+import torch
+from torch import Tensor
+import torch.nn.functional as F
 import math
 
-import torch
-import torch.nn.functional as F
-from torch import Tensor
+torch.nn.Conv2d(in_channels=1, out_channels=1, kernel_size=3, stride=1, padding=1, bias=False)
 
 
-_FD_ORDERS = (2, 4, 6)
+def _kernel_e_z(dz: float, device=None) -> Tensor:
+    """Forward-difference kernel along z: [0, -1, +1] / dz, shape (1,1,3,1)."""
+    return torch.tensor([[[[0.0], [-1.0], [1.0]]]], dtype=torch.complex64, device=device) / dz
 
 
-def _fd_pad(fd_order: int) -> int:
-    """Ghost/pad width for staggered composition at the given FD order.
-
-    Parameters
-    ----------
-    fd_order : int
-        ``2``, ``4``, or ``6`` (MaxwellNet-style staggered first derivatives).
-
-    Returns
-    -------
-    int
-        Samples to pad on each side so two sequential first derivatives
-        restore the original axis length (``2`` / ``4`` / ``6``).
-    """
-    if fd_order not in _FD_ORDERS:
-        raise ValueError(f"fd_order must be one of {_FD_ORDERS}, got {fd_order}")
-    return int(fd_order)
+def _kernel_h_z(dz: float, device=None) -> Tensor:
+    """Backward-difference kernel along z: [-1, +1, 0] / dz, shape (1,1,3,1)."""
+    return torch.tensor([[[[-1.0], [1.0], [0.0]]]], dtype=torch.complex64, device=device) / dz
 
 
-def _staggered_e_coeffs(fd_order: int) -> list[float]:
-    """Leading-zero staggered first-derivative taps (MaxwellNet ``gradient_e``)."""
-    if fd_order == 2:
-        return [0.0, -1.0, 1.0]
-    if fd_order == 4:
-        return [0.0, 1.0 / 24.0, -9.0 / 8.0, 9.0 / 8.0, -1.0 / 24.0]
-    if fd_order == 6:
-        return [
-            0.0,
-            -3.0 / 640.0,
-            25.0 / 384.0,
-            -75.0 / 64.0,
-            75.0 / 64.0,
-            -25.0 / 384.0,
-            3.0 / 640.0,
-        ]
-    raise ValueError(f"fd_order must be one of {_FD_ORDERS}, got {fd_order}")
+def _kernel_e_x(dx: float, device=None) -> Tensor:
+    """Forward-difference kernel along x: [0, -1, +1] / dx, shape (1,1,1,3)."""
+    return torch.tensor([[[[0.0, -1.0, 1.0]]]], dtype=torch.complex64, device=device) / dx
 
 
-def _staggered_h_coeffs(fd_order: int) -> list[float]:
-    """Trailing-zero staggered first-derivative taps (MaxwellNet ``gradient_h``)."""
-    if fd_order == 2:
-        return [-1.0, 1.0, 0.0]
-    if fd_order == 4:
-        return [1.0 / 24.0, -9.0 / 8.0, 9.0 / 8.0, -1.0 / 24.0, 0.0]
-    if fd_order == 6:
-        return [
-            -3.0 / 640.0,
-            25.0 / 384.0,
-            -75.0 / 64.0,
-            75.0 / 64.0,
-            -25.0 / 384.0,
-            3.0 / 640.0,
-            0.0,
-        ]
-    raise ValueError(f"fd_order must be one of {_FD_ORDERS}, got {fd_order}")
-
-
-def _kernel_e_z(dz: float, device=None, fd_order: int = 2) -> Tensor:
-    """Staggered forward-like ∂/∂z kernel, shape ``(1,1,K,1)``."""
-    coeffs = _staggered_e_coeffs(fd_order)
-    return (
-        torch.tensor([[[[c] for c in coeffs]]], dtype=torch.complex64, device=device)
-        / dz
-    )
-
-
-def _kernel_h_z(dz: float, device=None, fd_order: int = 2) -> Tensor:
-    """Staggered backward-like ∂/∂z kernel, shape ``(1,1,K,1)``."""
-    coeffs = _staggered_h_coeffs(fd_order)
-    return (
-        torch.tensor([[[[c] for c in coeffs]]], dtype=torch.complex64, device=device)
-        / dz
-    )
-
-
-def _kernel_e_x(dx: float, device=None, fd_order: int = 2) -> Tensor:
-    """Staggered forward-like ∂/∂x kernel, shape ``(1,1,1,K)``."""
-    coeffs = _staggered_e_coeffs(fd_order)
-    return torch.tensor([[[[*coeffs]]]], dtype=torch.complex64, device=device) / dx
-
-
-def _kernel_h_x(dx: float, device=None, fd_order: int = 2) -> Tensor:
-    """Staggered backward-like ∂/∂x kernel, shape ``(1,1,1,K)``."""
-    coeffs = _staggered_h_coeffs(fd_order)
-    return torch.tensor([[[[*coeffs]]]], dtype=torch.complex64, device=device) / dx
+def _kernel_h_x(dx: float, device=None) -> Tensor:
+    """Backward-difference kernel along x: [-1, +1, 0] / dx, shape (1,1,1,3)."""
+    return torch.tensor([[[[-1.0, 1.0, 0.0]]]], dtype=torch.complex64, device=device) / dx
 
 
 def _ensure_4d(t: Tensor) -> Tensor:
@@ -117,14 +35,8 @@ def _ensure_4d(t: Tensor) -> Tensor:
     return t
 
 
-def _pml_stretch_1d(
-    n: int,
-    delta: float,
-    pml_thickness: int,
-    pml_order: float = 4.0,
-    pml_strength: float = 5.0,
-    device=None,
-) -> Tensor:
+def _pml_stretch_1d(n: int, delta: float, pml_thickness: int, pml_order: float = 4.0,
+                    pml_strength: float = 5.0, device=None) -> Tensor:
     """
     Complex coordinate-stretching PML profile 1/s(z), following the same
     polynomial-graded construction as MaxwellNet's `rz_inverse` (m=4, const=5
@@ -166,17 +78,17 @@ def _pml_stretch_1d(
     r_n[pml_thickness:] = 0
 
     r = r_p + r_n
-    r[pml_thickness : n - pml_thickness] = 1
+    r[pml_thickness: n - pml_thickness] = 1
     return (1.0 / r).to(torch.complex64)
 
 
 def helmholtz_residual_loss(
-    E_field: Tensor,
-    epsilon_map: Tensor,
-    mode: str,
-    wavelength_a: float,
-    delta_x_a: float,
-    delta_z_a: float,
+        E_field: Tensor,
+        epsilon_map: Tensor,
+        mode: str,
+        wavelength_a: float,
+        delta_x_a: float,
+        delta_z_a: float,
 ) -> Tensor:
     """
     Compute the Helmholtz residual for a given total E-field and epsilon map,
@@ -245,48 +157,48 @@ def helmholtz_residual_loss(
     # Interior slice matching the (Nz-4, Nx-4) output of the Laplacians
     interior = (slice(None), slice(None), slice(2, -2), slice(2, -2))
 
-    if mode == "s":
+    if mode == 's':
         # ∂²Ey/∂z² + ∂²Ey/∂x² + k²·ε·Ey = 0
-        Ey = _ensure_4d(E_field.to(torch.complex64))
+        Ey  = _ensure_4d(E_field.to(torch.complex64))
         eps = _ensure_4d(epsilon_map.to(torch.complex64))
 
         # _lap_z(Ey): (Nz-4, Nx)   -> trim cols by 2 each side -> (Nz-4, Nx-4)
         # _lap_x(Ey): (Nz,   Nx-4) -> trim rows by 2 each side -> (Nz-4, Nx-4)
         diff = (
-            _lap_z(Ey)[:, :, :, 2:-2]
-            + _lap_x(Ey)[:, :, 2:-2, :]
-            + k**2 * eps[interior] * Ey[interior]
+                _lap_z(Ey)[:, :, :, 2:-2]
+                + _lap_x(Ey)[:, :, 2:-2, :]
+                + k**2 * eps[interior] * Ey[interior]
         )
         return diff.squeeze()
 
-    elif mode == "p":
+    elif mode == 'p':
         # Ez: ∂²Ez/∂x² - ∂²Ex/∂x∂z + k²·εz·Ez = 0
         # Ex: ∂²Ex/∂z² - ∂²Ez/∂z∂x + k²·εx·Ex = 0
         if E_field.dim() == 2:
             raise ValueError("p-pol E_field must have shape (2, Nz, Nx) [Ez, Ex]")
 
-        E_field = E_field.to(torch.complex64)
+        E_field     = E_field.to(torch.complex64)
         epsilon_map = epsilon_map.to(torch.complex64)
 
-        Ez = _ensure_4d(E_field[0])
-        Ex = _ensure_4d(E_field[1])
+        Ez    = _ensure_4d(E_field[0])
+        Ex    = _ensure_4d(E_field[1])
         eps_z = _ensure_4d(epsilon_map[0])
         eps_x = _ensure_4d(epsilon_map[1])
 
         # _lap_x(Ez):   (Nz,   Nx-4) -> trim rows by 2 each side -> (Nz-4, Nx-4)
         # _d_x_d_z(Ex): (Nz-2, Nx-2) -> trim both by 1 each side -> (Nz-4, Nx-4)
         diff_z = (
-            _lap_x(Ez)[:, :, 2:-2, :]
-            - _d_x_d_z(Ex)[:, :, 1:-1, 1:-1]
-            + k**2 * eps_z[interior] * Ez[interior]
+                _lap_x(Ez)[:, :, 2:-2, :]
+                - _d_x_d_z(Ex)[:, :, 1:-1, 1:-1]
+                + k**2 * eps_z[interior] * Ez[interior]
         )
 
         # _lap_z(Ex):   (Nz-4, Nx)   -> trim cols by 2 each side -> (Nz-4, Nx-4)
         # _d_z_d_x(Ez): (Nz-2, Nx-2) -> trim both by 1 each side -> (Nz-4, Nx-4)
         diff_x = (
-            _lap_z(Ex)[:, :, :, 2:-2]
-            - _d_z_d_x(Ez)[:, :, 1:-1, 1:-1]
-            + k**2 * eps_x[interior] * Ex[interior]
+                _lap_z(Ex)[:, :, :, 2:-2]
+                - _d_z_d_x(Ez)[:, :, 1:-1, 1:-1]
+                + k**2 * eps_x[interior] * Ex[interior]
         )
 
         return torch.stack([diff_z.squeeze(), diff_x.squeeze()])
@@ -296,59 +208,97 @@ def helmholtz_residual_loss(
 
 
 def helmholtz_residual_loss_periodic_pml(
-    envelope: Tensor,
-    epsilon_map: Tensor,
-    incident: Tensor,
-    kz,
-    kx,
-    mode: str,
-    wavelength_a: float,
-    delta_x_a: float,
-    delta_z_a: float,
-    pml_thickness: int,
-    pml_order: float = 4.0,
-    fd_order: int = 2,
+        envelope: Tensor,
+        epsilon_map: Tensor,
+        incident: Tensor,
+        kz,
+        kx,
+        mode: str,
+        wavelength_a: float,
+        delta_x_a: float,
+        delta_z_a: float,
+        pml_thickness: int,
+        pml_order: float = 4.0,
 ) -> Tensor:
     """
-    Helmholtz residual with periodic-x (Bloch) and transparent-z boundaries
-    for TE, matching the training loss path in ``train_maxwellnet``.
+    Helmholtz residual with a periodic (circular) boundary along x and a
+    complex-coordinate-stretching PML absorbing boundary along z, following
+    the same stretched-coordinate construction as MaxwellNet's
+    `rz_inverse`/`dd_z_pml`, generalized to an arbitrary physical z-spacing
+    and domain length (see `_pml_stretch_1d`).
 
-    Reconstructs ``E = incident * (1 + envelope)`` and returns the residual of
-    ``∇²E + k² ε E`` over the full domain. The Laplacian uses staggered
-    first-derivative composition of order ``fd_order`` (``2``, ``4``, or ``6``).
-    Order ``4`` matches MaxwellNet ``high_order='fourth'`` taps; order ``6``
-    extends the same staggered pattern via Fornberg weights.
+    Unlike `helmholtz_residual_loss`, nothing is trimmed. The x second
+    derivative wraps around with a Bloch/Floquet phase correction
+    (exp(∓i*kx*Lx), Lx = domain width) rather than plain repetition: the
+    field is only periodic *up to this phase factor* (E(x+Lx) = E(x)*e^{i kx
+    Lx}) unless kx*Lx happens to be an integer multiple of 2*pi, which is
+    generically false for an arbitrary oblique incidence angle. Plain
+    circular wraparound silently assumes phase = 1 and introduces a large,
+    spurious error with no real physical meaning (verified: >100% relative
+    error against the true incident wave's own analytic curvature, for a
+    generic non-commensurate angle) — this affects both `'s'` and `'p'`
+    mode's periodic-x derivatives, not just a PML-boundary-region artifact.
 
-    Parameters
-    ----------
-    envelope, epsilon_map, incident, kz, kx, mode, wavelength_a, delta_x_a,
-    delta_z_a, pml_thickness, pml_order
-        Same contracts as the historical second-order implementation.
-    fd_order : int, optional
-        Staggered FD order for TE Laplacians (default ``2``).
+    The total field E = incident * (1 + envelope) is reconstructed here,
+    not by the caller -- `envelope` is whatever ShapeNet.forward predicts
+    directly (a=0 -> E=incident, the zeroth-order Born approximation).
 
-    Returns
-    -------
-    Tensor
-        Complex residual with the same shape as ``envelope``.
+    The z second derivative is evaluated on the *scattered* field
+    (E - incident = incident * envelope), zero-padded at each z-edge before
+    PML grading — mirroring MaxwellNet's total-field/scattered-field split
+    (`ey_s`, `padding_zero`) — with the incident wave's own z-curvature
+    (computed with the same un-stretched finite-difference stencil, not the
+    analytic -kz**2*incident — see `_lap_z_pml_scattered`) added back in.
+    This anchors the total field to the known incident wave at the
+    z-truncation boundary: without it (i.e. differencing E directly with
+    replicate padding, the prior behavior of this function), the bare
+    residual is exactly zero for the trivial envelope ≡ -1 (E ≡ 0) solution
+    regardless of epsilon_map, and training can collapse the predicted
+    field to near-zero amplitude while still driving this loss to ~0. The
+    returned residual therefore covers the full input domain.
 
-    Raises
-    ------
-    NotImplementedError
-        When ``mode == 'p'`` and ``fd_order != 2``.
-    ValueError
-        When ``fd_order`` is not in ``(2, 4, 6)`` or ``mode`` is unknown.
+    Args:
+        envelope: predicted complex envelope `a` such that E = incident *
+            (1 + a), as returned by `ShapeNet.forward` (s-pol: Ey envelope;
+            p-pol: (Ez, Ex) envelopes) -- NOT the total field.
+        epsilon_map, mode, wavelength_a, delta_x_a, delta_z_a: same
+            shapes/conventions as `helmholtz_residual_loss` (s-pol: Ey;
+            p-pol: (Ez, Ex) / [εz, εx]).
+        incident: incident plane wave e^(i k·r), same shape convention as
+            envelope but without the p-pol component axis — (Nz, Nx) or
+            (batch, Nz, Nx) — as returned by `ShapeNet.forward`.
+        kz, kx: incident wave's z- and x-wavevector components, scalar or
+            (batch,), as returned by `ShapeNet.forward`.
+        pml_thickness: number of grid samples, at each z-edge, over which the
+            PML grades from transparent (interior) to absorbing.
+        pml_order, pml_strength: PML grading polynomial order and absorption
+            strength — defaults (4, 5) match MaxwellNet's hardcoded values.
+
+    Returns:
+        Complex residual tensor, same shape as envelope ((Nz, Nx) for s-pol,
+        (2, Nz, Nx) for p-pol).
+
+    Note: the p-pol path mirrors MaxwellNet's `dd_zx_pml`/`dd_xz_pml`
+    cross-derivative treatment (single PML stretch factor at the z-derivative
+    stage of each mixed term, x Bloch-periodic since it's periodic-up-to-a-
+    phase), but is not covered by the (s-pol only) test data used to
+    validate this module.
     """
     k = 2 * math.pi / wavelength_a
     dx = delta_x_a
     dz = delta_z_a
-    pad = _fd_pad(fd_order)
+
     pml_strength = 5
 
     def _pad_z(f: Tensor, n: int) -> Tensor:
-        return F.pad(f, (0, 0, n, n), mode="replicate")
+        return F.pad(f, (0, 0, n, n), mode='replicate')
 
     def _bloch_pad_x(f: Tensor, n: int, kx_) -> Tensor:
+        """Pad n columns on each side along x with a Bloch/Floquet phase
+        correction (exp(∓i*kx*Lx), Lx = f's own x-extent) instead of plain
+        repetition — the field is periodic only up to this phase factor
+        unless kx*Lx happens to be an integer multiple of 2*pi, which is
+        generically false for an oblique incidence angle."""
         Lx = f.shape[-1] * dx
         kx_t = torch.as_tensor(kx_, dtype=torch.float32, device=f.device)
         if kx_t.dim() > 0:
@@ -359,128 +309,180 @@ def helmholtz_residual_loss_periodic_pml(
         right = f[..., :n] * phase
         return torch.cat([left, f, right], dim=-1)
 
-    def _inc_z_ghosts(inc: Tensor, kz_, n: int) -> Tensor:
-        kz_t = torch.as_tensor(kz_, dtype=torch.float32, device=inc.device)
+    def _lap_z_pml_scattered(f: Tensor, inc: Tensor, kz_) -> Tensor:
+        """∂²f/∂z² with PML absorption, computed on the scattered field
+        (f - inc) with a hard zero boundary (instead of replicating f
+        itself), plus the incident wave's own z-curvature added back —
+        anchoring f to the known incident wave at the z-truncation boundary.
+
+        The incident-curvature correction is computed with the *same*
+        (un-stretched) finite-difference stencil used on the scattered
+        field, not the analytic -kz**2*inc — by linearity of the stencil,
+        [stencil(scattered)] + [stencil(incident)] == [stencil(total field)]
+        exactly, whatever the stencil's own numerical-dispersion error is.
+        Using the exact analytic value instead would mix a dispersion-free
+        term with a dispersion-imperfect one, creating a spurious residual
+        (unrelated to any real scatterer) the network would have to spend
+        capacity compensating for — mirroring MaxwellNet's `dd_z_fast`,
+        which is likewise a finite difference of the precomputed incident
+        field rather than an analytic expression. Output z-length == f's
+        z-length."""
+        scattered = f - inc
+        padded = F.pad(scattered, (0, 0, 2, 2), mode='constant', value=0)
+        rz_inv = _pml_stretch_1d(padded.shape[-2], dz, pml_thickness, pml_order,
+                                 pml_strength, device=f.device)
+        e = F.conv2d(padded, _kernel_e_z(dz, f.device), padding=0)
+        e = e * rz_inv[1:-1].reshape(1, 1, -1, 1)
+        h = F.conv2d(e, _kernel_h_z(dz, f.device), padding=0)
+        h = h * rz_inv[2:-2].reshape(1, 1, -1, 1)
+
+        # Extend `inc` by 2 exact ghost rows on each z-edge via its own
+        # closed-form phase advance (exp(i*kz*dz) per step) rather than
+        # replicate-padding, then difference it with the same stencil, no
+        # PML stretching (matching dd_z_fast, which isn't PML-stretched
+        # either — the incident wave isn't what the PML is meant to absorb).
+        kz_t = torch.as_tensor(kz_, dtype=torch.float32, device=f.device)
         if kz_t.dim() > 0:
             kz_t = kz_t.reshape(-1, 1, 1, 1)
         angle = kz_t * dz
         step = torch.complex(torch.cos(angle), torch.sin(angle)).to(inc.dtype)
-        below = [inc[..., :1, :] * torch.conj(step) ** p for p in range(n, 0, -1)]
-        above = [inc[..., -1:, :] * step**p for p in range(1, n + 1)]
-        return torch.cat([*below, inc, *above], dim=-2)
+        below2 = inc[..., :1, :] * torch.conj(step) ** 2
+        below1 = inc[..., :1, :] * torch.conj(step)
+        above1 = inc[..., -1:, :] * step
+        above2 = inc[..., -1:, :] * step ** 2
+        inc_padded = torch.cat([below2, below1, inc, above1, above2], dim=-2)
+        e_inc = F.conv2d(inc_padded, _kernel_e_z(dz, f.device), padding=0)
+        correction = F.conv2d(e_inc, _kernel_h_z(dz, f.device), padding=0)
 
-    def _lap_z_pml_scattered(f: Tensor, inc: Tensor, kz_) -> Tensor:
-        scattered = f - inc
-        padded = F.pad(scattered, (0, 0, pad, pad), mode="constant", value=0)
-        rz_inv = _pml_stretch_1d(
-            padded.shape[-2],
-            dz,
-            pml_thickness,
-            pml_order,
-            pml_strength,
-            device=f.device,
-        )
-        half = pad // 2
-        e = F.conv2d(padded, _kernel_e_z(dz, f.device, fd_order=fd_order), padding=0)
-        e = e * rz_inv[half:-half].reshape(1, 1, -1, 1)
-        h = F.conv2d(e, _kernel_h_z(dz, f.device, fd_order=fd_order), padding=0)
-        h = h * rz_inv[pad:-pad].reshape(1, 1, -1, 1)
-        inc_padded = _inc_z_ghosts(inc, kz_, pad)
-        e_inc = F.conv2d(
-            inc_padded, _kernel_e_z(dz, f.device, fd_order=fd_order), padding=0
-        )
-        correction = F.conv2d(
-            e_inc, _kernel_h_z(dz, f.device, fd_order=fd_order), padding=0
-        )
         return h + correction
 
     def _lap_z_transparent(f: Tensor, inc: Tensor, kz_, kx_) -> Tensor:
+        """∂²f/∂z² with an exact transparent (non-reflecting) boundary
+        condition at each z edge, in place of PML. PML's "scattered field
+        -> 0 at the truncation" assumption (via hard zero-padding, see
+        `_lap_z_pml_scattered`) is only valid if the true scattered field
+        actually decays to ~0 near the domain edges -- false whenever the
+        domain contains a persistent background structure (e.g. a
+        thin-film slab) whose own reflection/transmission response doesn't
+        decay, propagating as genuine plane waves all the way to both
+        edges. A transparent BC sidesteps needing to know *why* the field
+        doesn't vanish there at all: it only requires the medium AT each
+        edge to be homogeneous (vacuum, verified empirically for this
+        dataset), which lets the scattered field there be decomposed
+        exactly into discrete Bloch/Rayleigh orders kx_n = kx + 2*pi*n/Lx
+        (via FFT along x, after removing the field's own Bloch phase
+        carrier -- same phase convention `_bloch_pad_x` already corrects
+        for), each independently satisfying kz_n = sqrt(k^2 - kx_n^2)
+        (real: propagating; complex: evanescent). "Transparent" then means:
+        whatever combination of these modes is present at the boundary row
+        continues propagating/decaying straight out of the domain, with
+        nothing reflected back in -- the ghost row p steps beyond an edge
+        is that edge's own boundary-row spectrum times exp(i*kz_n*p*dz)
+        per mode (principal branch, Im(kz_n)>=0, so evanescent modes decay
+        moving away from the domain using this same edge-local rule at
+        *either* edge -- no separate incidence-side/far-side bookkeeping
+        needed, unlike a literal Fresnel-background approach). This is
+        exact given a homogeneous boundary medium, unlike PML's graded
+        approximation, and needs no thickness/order/strength tuning.
+
+        The known incident wave's own z-curvature correction is unchanged
+        from `_lap_z_pml_scattered` (linearity: stencil(scattered) +
+        stencil(incident) == stencil(total), and incident is a single
+        known plane wave -- no Rayleigh decomposition needed for it).
+        Output z-length == f's z-length, same contract as
+        `_lap_z_pml_scattered` -- drop-in replacement."""
         scattered = f - inc
         nx = scattered.shape[-1]
+        Lx = nx * dx
+
         kx_t = torch.as_tensor(kx_, dtype=torch.float32, device=f.device)
         if kx_t.dim() > 0:
             kx_t = kx_t.reshape(-1, 1, 1, 1)
         x_idx = torch.arange(nx, device=f.device, dtype=torch.float32)
         carrier_angle = kx_t * x_idx * dx
-        carrier = torch.complex(torch.cos(carrier_angle), torch.sin(carrier_angle)).to(
-            f.dtype
-        )
-        s_periodic = scattered * torch.conj(carrier)
-        spectrum = torch.fft.fft(s_periodic, dim=-1)
-        n_idx = torch.fft.fftfreq(nx, d=dx, device=f.device) * 2 * math.pi
-        kx_n = kx_t + n_idx.reshape(1, 1, 1, nx)
-        kz_n = torch.sqrt((k**2 - kx_n**2).to(torch.complex64))
+        carrier = torch.complex(torch.cos(carrier_angle), torch.sin(carrier_angle)).to(f.dtype)
+        s_periodic = scattered * torch.conj(carrier)  # remove Bloch phase -> exactly Lx-periodic
 
-        def _ghost(spectrum_row: Tensor, p: int, kz_edge: Tensor) -> Tensor:
-            phase = torch.exp(1j * kz_edge * p * dz)
+        spectrum = torch.fft.fft(s_periodic, dim=-1)  # (B,1,Nz,Nx) per-mode amplitude, every z row
+        n_idx = torch.fft.fftfreq(nx, d=dx, device=f.device) * 2 * math.pi  # angular 2*pi*n/Lx per bin
+        kx_n = kx_t + n_idx.reshape(1, 1, 1, nx)
+        kz_n = torch.sqrt((k**2 - kx_n**2).to(torch.complex64))  # principal branch, Im>=0
+
+        def _ghost(spectrum_row: Tensor, p: int) -> Tensor:
+            phase = torch.exp(1j * kz_n * p * dz)
             return torch.fft.ifft(spectrum_row * phase, dim=-1) * carrier
 
-        top = [_ghost(spectrum[..., :1, :], p, kz_n) for p in range(pad, 0, -1)]
-        bot = [_ghost(spectrum[..., -1:, :], p, -kz_n) for p in range(1, pad + 1)]
-        padded = torch.cat([*top, scattered, *bot], dim=-2).to(f.dtype)
-        e = F.conv2d(padded, _kernel_e_z(dz, f.device, fd_order=fd_order), padding=0)
-        h = F.conv2d(e, _kernel_h_z(dz, f.device, fd_order=fd_order), padding=0)
-        inc_padded = _inc_z_ghosts(inc, kz_, pad)
-        e_inc = F.conv2d(
-            inc_padded, _kernel_e_z(dz, f.device, fd_order=fd_order), padding=0
-        )
-        correction = F.conv2d(
-            e_inc, _kernel_h_z(dz, f.device, fd_order=fd_order), padding=0
-        )
+        ghost_top2 = _ghost(spectrum[..., :1, :], 2)
+        ghost_top1 = _ghost(spectrum[..., :1, :], 1)
+        ghost_bot1 = _ghost(spectrum[..., -1:, :], 1)
+        ghost_bot2 = _ghost(spectrum[..., -1:, :], 2)
+        padded = torch.cat(
+            [ghost_top2, ghost_top1, scattered, ghost_bot1, ghost_bot2], dim=-2
+        ).to(f.dtype)
+
+        e = F.conv2d(padded, _kernel_e_z(dz, f.device), padding=0)
+        h = F.conv2d(e, _kernel_h_z(dz, f.device), padding=0)
+
+        kz_t = torch.as_tensor(kz_, dtype=torch.float32, device=f.device)
+        if kz_t.dim() > 0:
+            kz_t = kz_t.reshape(-1, 1, 1, 1)
+        angle = kz_t * dz
+        step = torch.complex(torch.cos(angle), torch.sin(angle)).to(inc.dtype)
+        below2 = inc[..., :1, :] * torch.conj(step) ** 2
+        below1 = inc[..., :1, :] * torch.conj(step)
+        above1 = inc[..., -1:, :] * step
+        above2 = inc[..., -1:, :] * step ** 2
+        inc_padded = torch.cat([below2, below1, inc, above1, above2], dim=-2)
+        e_inc = F.conv2d(inc_padded, _kernel_e_z(dz, f.device), padding=0)
+        correction = F.conv2d(e_inc, _kernel_h_z(dz, f.device), padding=0)
+
         return h + correction
 
     def _lap_x_periodic(f: Tensor, kx_) -> Tensor:
-        padded = _bloch_pad_x(f, pad, kx_)
-        e = F.conv2d(padded, _kernel_e_x(dx, f.device, fd_order=fd_order), padding=0)
-        h = F.conv2d(e, _kernel_h_x(dx, f.device, fd_order=fd_order), padding=0)
+        """∂²f/∂x² with Bloch-periodic wraparound, output x-length == f's
+        x-length."""
+        padded = _bloch_pad_x(f, 2, kx_)
+        e = F.conv2d(padded, _kernel_e_x(dx, f.device), padding=0)
+        h = F.conv2d(e, _kernel_h_x(dx, f.device), padding=0)
         return h
 
     def _d_x_d_z_pml(f: Tensor, kx_) -> Tensor:
+        """∂²f/∂x∂z = d_h_x( pml_z(d_e_z(f)) ), output shape == f's shape."""
         padded = _bloch_pad_x(_pad_z(f, 1), 1, kx_)
-        rz_inv = _pml_stretch_1d(
-            padded.shape[-2],
-            dz,
-            pml_thickness,
-            pml_order,
-            pml_strength,
-            device=f.device,
-        )
-        e = F.conv2d(padded, _kernel_e_z(dz, f.device, fd_order=2), padding=0)
+        rz_inv = _pml_stretch_1d(padded.shape[-2], dz, pml_thickness, pml_order,
+                                 pml_strength, device=f.device)
+        e = F.conv2d(padded, _kernel_e_z(dz, f.device), padding=0)
         e = e * rz_inv[1:-1].reshape(1, 1, -1, 1)
-        return F.conv2d(e, _kernel_h_x(dx, f.device, fd_order=2), padding=0)
+        return F.conv2d(e, _kernel_h_x(dx, f.device), padding=0)
 
     def _d_z_d_x_pml(f: Tensor, kx_) -> Tensor:
+        """∂²f/∂z∂x = pml_z( d_h_z(d_e_x(f)) ), output shape == f's shape."""
         padded = _bloch_pad_x(_pad_z(f, 1), 1, kx_)
-        rz_inv = _pml_stretch_1d(
-            padded.shape[-2],
-            dz,
-            pml_thickness,
-            pml_order,
-            pml_strength,
-            device=f.device,
-        )
-        e = F.conv2d(padded, _kernel_e_x(dx, f.device, fd_order=2), padding=0)
-        h = F.conv2d(e, _kernel_h_z(dz, f.device, fd_order=2), padding=0)
+        rz_inv = _pml_stretch_1d(padded.shape[-2], dz, pml_thickness, pml_order,
+                                 pml_strength, device=f.device)
+        e = F.conv2d(padded, _kernel_e_x(dx, f.device), padding=0)
+        h = F.conv2d(e, _kernel_h_z(dz, f.device), padding=0)
         return h * rz_inv[1:-1].reshape(1, 1, -1, 1)
 
-    if mode == "s":
+    if mode == 's':
+        # squeeze() alone is ambiguous between "unbatched (Nz,Nx) input"
+        # and "batched (B,Nz,Nx) input with B==1" -- both look identical
+        # after _ensure_4d (both become (1,1,Nz,Nx)), but the former should
+        # return (Nz,Nx) while the latter must keep its (now-1-long) batch
+        # dim, or a batch-size-1 caller (e.g. a single-sample DataLoader)
+        # silently gets back a bare (Nz,Nx) tensor with no batch axis,
+        # corrupting any downstream `residual[0]` indexing.
         is_batched = envelope.dim() >= 3
+
         a_y = _ensure_4d(envelope.to(torch.complex64))
         eps = _ensure_4d(epsilon_map.to(torch.complex64))
         inc = _ensure_4d(incident.to(torch.complex64))
-        Ey = (1.0 + a_y) * inc
-        diff = (
-            _lap_z_transparent(Ey, inc, kz, kx)
-            + _lap_x_periodic(Ey, kx)
-            + k**2 * eps * Ey
-        )
+        Ey  = (1.0 + a_y) * inc
+
+        diff = _lap_z_transparent(Ey, inc, kz, kx) + _lap_x_periodic(Ey, kx) + k**2 * eps * Ey
         return diff.squeeze(1) if is_batched else diff.squeeze()
 
-    elif mode == "p":
-        if fd_order != 2:
-            raise NotImplementedError(
-                "p-pol Helmholtz residual currently supports fd_order=2 only"
-            )
+    elif mode == 'p':
         if envelope.dim() == 3:
             is_batched = False
             az_raw, ax_raw = envelope[0], envelope[1]
@@ -491,95 +493,22 @@ def helmholtz_residual_loss_periodic_pml(
             eps_z_raw, eps_x_raw = epsilon_map[:, 0], epsilon_map[:, 1]
         else:
             raise ValueError(
-                "p-pol envelope must have shape (2, Nz, Nx) [Ez, Ex] or (batch, 2, Nz, Nx)"
-            )
-        a_z = _ensure_4d(az_raw.to(torch.complex64))
-        a_x = _ensure_4d(ax_raw.to(torch.complex64))
+                "p-pol envelope must have shape (2, Nz, Nx) [Ez, Ex] or (batch, 2, Nz, Nx)")
+
+        a_z   = _ensure_4d(az_raw.to(torch.complex64))
+        a_x   = _ensure_4d(ax_raw.to(torch.complex64))
         eps_z = _ensure_4d(eps_z_raw.to(torch.complex64))
         eps_x = _ensure_4d(eps_x_raw.to(torch.complex64))
-        inc = _ensure_4d(incident.to(torch.complex64))
-        Ez = (1.0 + a_z) * inc
-        Ex = (1.0 + a_x) * inc
-        diff_z = (
-            _lap_x_periodic(Ez, kx) - _d_x_d_z_pml(Ex, kx) + k**2 * eps_z * Ez
-        ).squeeze(1)
-        diff_x = (
-            _lap_z_pml_scattered(Ex, inc, kz) - _d_z_d_x_pml(Ez, kx) + k**2 * eps_x * Ex
-        ).squeeze(1)
+        inc   = _ensure_4d(incident.to(torch.complex64))
+        Ez    = (1.0 + a_z) * inc
+        Ex    = (1.0 + a_x) * inc
+
+        diff_z = (_lap_x_periodic(Ez, kx) - _d_x_d_z_pml(Ex, kx) + k**2 * eps_z * Ez).squeeze(1)
+        diff_x = (_lap_z_pml_scattered(Ex, inc, kz) - _d_z_d_x_pml(Ez, kx) + k**2 * eps_x * Ex).squeeze(1)
+
         if is_batched:
-            return torch.stack([diff_z, diff_x], dim=1)
-        return torch.stack([diff_z.squeeze(0), diff_x.squeeze(0)])
+            return torch.stack([diff_z, diff_x], dim=1)  # (B, 2, Nz, Nx)
+        return torch.stack([diff_z.squeeze(0), diff_x.squeeze(0)])  # (2, Nz, Nx)
 
     else:
         raise ValueError(f"mode must be 's' or 'p', got '{mode}'")
-
-
-def validate_laplacian_orders(
-    field: Tensor,
-    dx: float,
-    dz: float,
-    kx: float,
-    kz: float,
-    orders: tuple[int, ...] = (2, 4, 6),
-) -> dict[int, dict[str, float]]:
-    """Score staggered Laplacian orders against an analytic plane-wave curvature.
-
-    Applies Bloch-periodic ``∂²/∂x²`` and exact phase-ghost ``∂²/∂z²`` (no PML)
-    to ``field ≈ exp(i(kx x + kz z))`` and compares to ``-(kx²+kz²) field``.
-    Higher ``fd_order`` should reduce interior relative error for a resolved
-    plane wave.
-
-    Parameters
-    ----------
-    field : Tensor
-        Complex ``(Nz, Nx)`` plane-wave sample.
-    dx, dz : float
-        Grid spacings matching the wavevector units.
-    kx, kz : float
-        Plane-wave wavevector components.
-    orders : tuple of int
-        Subset of ``(2, 4, 6)`` to evaluate.
-
-    Returns
-    -------
-    dict
-        ``order -> {mean_rel, max_rel, mean_abs}`` on the interior crop
-        ``[pad:-pad, pad:-pad]`` where ``pad = fd_order``.
-    """
-    if field.dim() != 2:
-        raise ValueError(f"expected (Nz, Nx) field, got shape {tuple(field.shape)}")
-    f = _ensure_4d(field.to(torch.complex64))
-    analytic = -(kx**2 + kz**2) * f
-    out: dict[int, dict[str, float]] = {}
-    for order in orders:
-        pad = _fd_pad(order)
-        Lx = f.shape[-1] * dx
-        angle = torch.tensor(kx * Lx, dtype=torch.float32, device=f.device)
-        phase = torch.complex(torch.cos(angle), torch.sin(angle)).to(f.dtype)
-        px = torch.cat(
-            [f[..., -pad:] * torch.conj(phase), f, f[..., :pad] * phase], dim=-1
-        )
-        e_x = F.conv2d(px, _kernel_e_x(dx, f.device, fd_order=order), padding=0)
-        lap_x = F.conv2d(e_x, _kernel_h_x(dx, f.device, fd_order=order), padding=0)
-
-        step = torch.exp(
-            torch.complex(
-                torch.tensor(0.0, device=f.device),
-                torch.tensor(kz * dz, dtype=torch.float32, device=f.device),
-            )
-        ).to(f.dtype)
-        below = [f[..., :1, :] * torch.conj(step) ** p for p in range(pad, 0, -1)]
-        above = [f[..., -1:, :] * step**p for p in range(1, pad + 1)]
-        pz = torch.cat([*below, f, *above], dim=-2)
-        e_z = F.conv2d(pz, _kernel_e_z(dz, f.device, fd_order=order), padding=0)
-        lap_z = F.conv2d(e_z, _kernel_h_z(dz, f.device, fd_order=order), padding=0)
-
-        err = (lap_x + lap_z - analytic).abs()
-        rel = err / analytic.abs().clamp_min(1e-30)
-        crop = (slice(None), slice(None), slice(pad, -pad), slice(pad, -pad))
-        out[order] = {
-            "mean_rel": float(rel[crop].mean()),
-            "max_rel": float(rel[crop].max()),
-            "mean_abs": float(err[crop].mean()),
-        }
-    return out

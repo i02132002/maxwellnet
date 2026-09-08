@@ -50,8 +50,9 @@ wavenumber, and a complete set of radiation / periodic / interface conditions,
 r = Laplacian_FD(E) + k^2 * epsilon * E
 ```
 
-with staggered MaxwellNet kernels, Bloch ghosts in x, transparent (or PML)
-ghosts in z, and a TF/SF split `E = E_i (1 + a)`. FEM solves a weak form on
+with staggered MaxwellNet kernels, Bloch ghosts in x, and transparent
+ghosts in z (the TE training operator on main and `fl/supervised`; not PML),
+and a TF/SF split `E = E_i (1 + a)`. FEM solves a weak form on
 its own mesh and basis, then the field is resampled onto the Yee grid.
 
 Those are not the same equation. A unique continuous solution can still have a
@@ -159,7 +160,7 @@ one of them.
 
 1. **Grid / interpolation.** FEM `E` resampled onto the Yee cell is not the
    staggered field the FD operator expects (centering, epsilon averaging).
-2. **Boundary model.** FEM radiation / PML / periodicity vs Bloch ghosts plus
+2. **Boundary model.** FEM radiation / periodicity vs Bloch ghosts plus
    transparent-z (FFT) ghosts. Residual maps concentrate at z-edges; the
    interior dip remains after dropping +/-2 rows.
 3. **Incident / TF-SF.** Matched `E_i` fixes global phase. A residual
@@ -176,12 +177,13 @@ one of them.
 Next measurements that would distinguish these: evaluate `r` on FEM using
 FEM's own weak residual; compare FD residual of an FD reference solve on the
 same grid; restrict the blend to vacuum-only vs scatterer-only support;
-replace transparent-z with the training PML on z and re-trace alpha.
+replace transparent-z with a different z BC and re-trace alpha.
 
 ## How to regenerate
 
 From `notebooks/`, run [loss_behavior.ipynb](loss_behavior.ipynb) top to
 bottom. Section 6 is the order-2 blend; section 7 is the phase-screen control;
-section 8 overlays FD orders 2/4/6 (linestyle) on one panel. Helmholtz scoring
-uses `helmholtz_residual_loss_periodic_pml(..., fd_order=...)` in
-`maxwell_losses/helmholtz_checker.py`.
+section 8 overlays FD orders 2/4/6 (linestyle) on one panel. Order 2 uses
+`maxwell_losses/helmholtz_checker.py` unchanged. Orders 4 and 6 inject
+staggered kernels (`staggered_fd.py`) through
+`helmholtz_checker_o4.py` / `helmholtz_checker_o6.py`.
