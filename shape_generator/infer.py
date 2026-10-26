@@ -3,6 +3,7 @@
 Run from the repo root:  python -m shape_generator.infer [--config path/to/config.json]
 """
 import argparse
+import os
 
 import matplotlib.pyplot as plt
 import torch
@@ -36,9 +37,10 @@ def plot_grid(images, channel, path=None, show=False):
     fig, axes = plt.subplots(3, 3, figsize=(9.5, 9))
     fig.subplots_adjust(left=0, right=0.9, bottom=0, top=0.95, wspace=0.01, hspace=0.01)  # thin white lines between tiles
     vmin, vmax = images[:, c].min().item(), images[:, c].max().item()
+    for ax in axes.flat:
+        ax.axis("off")  # also hides unused tiles when fewer than 9 images are given
     for ax, img in zip(axes.flat, images):
         im = ax.imshow(img[c], cmap="viridis", vmin=vmin, vmax=vmax)
-        ax.axis("off")
     cax = fig.add_axes([0.92, 0.15, 0.02, 0.65])
     fig.colorbar(im, cax=cax, label=f"optical_constant_{channel}")
     fig.suptitle(f"Generated shapes ({channel})")
@@ -59,7 +61,10 @@ def main():
                           else "mps" if torch.backends.mps.is_available() else "cpu")
     unet, scheduler, normalizer = load_checkpoint(c.ckpt, device)
     images = sample(unet, scheduler, normalizer, 9, device, c.steps, c.seed)
-    plot_grid(images, c.channel, c.out, show=True)
+    root, ext = os.path.splitext(c.out)
+    for channel in ("real", "imag"):
+        plot_grid(images, channel, f"{root}_{channel}{ext}")
+    plt.show()
 
 
 if __name__ == "__main__":

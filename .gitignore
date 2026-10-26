@@ -11,6 +11,7 @@ test_run1/
 examples/
 shape_generator/runs/
 shape_generator/data/
+shape_generator/*.png
 wandb/
 
 __pycache__/

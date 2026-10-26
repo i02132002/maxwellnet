@@ -29,31 +29,57 @@ def build_unet(block_out_channels=(32, 64, 128, 128, 256, 256), image_size=IMAGE
     )
 
 
-def build_scheduler(num_train_timesteps=1000):
-    return DDPMScheduler(num_train_timesteps=num_train_timesteps, beta_schedule="squaredcos_cap_v2")
+def build_scheduler(num_train_timesteps=1000, clip_sample=True):
+    """clip_sample clips each predicted clean image to [-1, 1]; only valid for min/max-normalized data."""
+    return DDPMScheduler(num_train_timesteps=num_train_timesteps, beta_schedule="squaredcos_cap_v2",
+                         clip_sample=clip_sample)
 
 
 class Normalizer:
-    """Per-channel affine map from raw optical constants to [-1, 1] (and back)."""
+    """Per-channel affine map z = (x - shift) / scale from raw optical constants to model space (and back).
 
-    def __init__(self, lo, hi):
-        self.lo = torch.as_tensor(lo, dtype=torch.float32).view(1, -1, 1, 1)
-        self.hi = torch.as_tensor(hi, dtype=torch.float32).view(1, -1, 1, 1)
+    mode "minmax": maps [lo, hi] to [-1, 1] (shift = midpoint, scale = half range); decode clamps to [-1, 1].
+    mode "standard": zero mean, unit std (shift = mean, scale = std); the output is unbounded.
+    """
+
+    def __init__(self, shift, scale, mode="standard"):
+        assert mode in ("minmax", "standard"), mode
+        self.shift = torch.as_tensor(shift, dtype=torch.float32).view(1, -1, 1, 1)
+        self.scale = torch.as_tensor(scale, dtype=torch.float32).view(1, -1, 1, 1)
+        self.mode = mode
+
+    @classmethod
+    def fit(cls, imgs, mode="standard"):
+        """imgs: (N, C, H, W) raw images."""
+        if mode == "minmax":
+            lo, hi = imgs.amin(dim=(0, 2, 3)), imgs.amax(dim=(0, 2, 3))
+            # Guard against a constant channel (e.g. all-zero imag part).
+            hi = torch.where(hi - lo < 1e-8, lo + 1.0, hi)
+            return cls((lo + hi) / 2, (hi - lo) / 2, mode)
+        mean, std = imgs.mean(dim=(0, 2, 3)), imgs.std(dim=(0, 2, 3))
+        return cls(mean, torch.where(std < 1e-8, torch.ones_like(std), std), mode)
+
+    @property
+    def bounded(self):
+        return self.mode == "minmax"
 
     def encode(self, x):
-        lo, hi = self.lo.to(x.device), self.hi.to(x.device)
-        return 2 * (x - lo) / (hi - lo).clamp_min(1e-12) - 1
+        return (x - self.shift.to(x.device)) / self.scale.to(x.device)
 
     def decode(self, x):
-        lo, hi = self.lo.to(x.device), self.hi.to(x.device)
-        return (x.clamp(-1, 1) + 1) / 2 * (hi - lo) + lo
+        if self.bounded:
+            x = x.clamp(-1, 1)
+        return x * self.scale.to(x.device) + self.shift.to(x.device)
 
     def state_dict(self):
-        return {"lo": self.lo.flatten().tolist(), "hi": self.hi.flatten().tolist()}
+        return {"mode": self.mode, "shift": self.shift.flatten().tolist(), "scale": self.scale.flatten().tolist()}
 
     @classmethod
     def from_state_dict(cls, d):
-        return cls(d["lo"], d["hi"])
+        if "lo" in d:  # checkpoints saved before standard scaling existed
+            lo, hi = torch.tensor(d["lo"]), torch.tensor(d["hi"])
+            return cls((lo + hi) / 2, (hi - lo).clamp_min(1e-12) / 2, "minmax")
+        return cls(d["shift"], d["scale"], d["mode"])
 
 
 def save_checkpoint(path, unet, normalizer, unet_kwargs, num_train_timesteps, step):
@@ -71,5 +97,6 @@ def load_checkpoint(path, device):
     unet = build_unet(**ckpt["unet_kwargs"]).to(device)
     unet.load_state_dict(ckpt["unet"])
     unet.eval()
-    scheduler = build_scheduler(ckpt["num_train_timesteps"])
-    return unet, scheduler, Normalizer.from_state_dict(ckpt["normalizer"])
+    normalizer = Normalizer.from_state_dict(ckpt["normalizer"])
+    scheduler = build_scheduler(ckpt["num_train_timesteps"], clip_sample=normalizer.bounded)
+    return unet, scheduler, normalizer

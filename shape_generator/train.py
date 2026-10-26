@@ -3,8 +3,10 @@
 Run from the repo root:  python -m shape_generator.train [--config path/to/config.json]
 """
 import argparse
+import math
 from dataclasses import asdict
 import os
+import shutil
 
 import matplotlib
 matplotlib.use("Agg")  # eval plots are saved/logged, never shown
@@ -23,20 +25,16 @@ from shape_generator.model import (  # noqa: E402
 )
 
 
-def compute_normalizer(dataset, n=256):
+def compute_normalizer(dataset, mode, n=256):
     idx = torch.randperm(len(dataset))[:min(n, len(dataset))].tolist()
     imgs = torch.stack([dataset[i]["optical_constant_image"] for i in idx])
-    lo = imgs.amin(dim=(0, 2, 3))
-    hi = imgs.amax(dim=(0, 2, 3))
-    # Guard against a constant channel (e.g. all-zero imag part).
-    hi = torch.where(hi - lo < 1e-8, lo + 1.0, hi)
-    return Normalizer(lo, hi)
+    return Normalizer.fit(imgs, mode)
 
 
 def run_eval(unet, scheduler, normalizer, device, t, epoch):
     """Sample 9 shapes from the same fixed noise every epoch; save + return the 3x3 figures."""
     unet.eval()
-    images = sample(unet, scheduler, normalizer, 9, device, t.eval_steps, t.eval_seed)
+    images = sample(unet, scheduler, normalizer, 9, device, t.eval_diffusion_timesteps, t.eval_seed)
     unet.train()
     figs = {}
     for channel in ("real", "imag"):
@@ -95,16 +93,30 @@ def main():
                                                    num_workers=d.num_workers)
     loader = torch.utils.data.DataLoader(train_ds, batch_size=t.batch_size, shuffle=True,
                                          num_workers=d.num_workers, drop_last=True)
-    normalizer = compute_normalizer(train_ds)
+    normalizer = compute_normalizer(train_ds, d.normalization)
     print("normalizer:", normalizer.state_dict())
 
     unet_kwargs = {"block_out_channels": m.block_out_channels, "image_size": m.image_size,
                    "layers_per_block": m.layers_per_block,
                    "attention_levels": m.attention_levels}
     unet = build_unet(**unet_kwargs).to(device)
-    scheduler = build_scheduler(m.timesteps)
+    scheduler = build_scheduler(m.timesteps, clip_sample=normalizer.bounded)
     print(f"UNet params: {sum(p.numel() for p in unet.parameters()) / 1e6:.1f}M")
     opt = torch.optim.AdamW(unet.parameters(), lr=t.lr)
+    total_steps = t.epochs * len(loader)
+    if t.warmup_steps >= total_steps:
+        raise ValueError(f"train.warmup_steps ({t.warmup_steps}) must be < total steps ({total_steps})")
+
+    def lr_factor(step):
+        if step < t.warmup_steps:
+            return (step + 1) / t.warmup_steps
+        if t.lr_schedule == "constant":
+            return 1.0
+        progress = (step - t.warmup_steps) / (total_steps - t.warmup_steps)
+        floor = t.min_lr / t.lr
+        return floor + (1 - floor) * 0.5 * (1 + math.cos(math.pi * progress))
+
+    lr_sched = torch.optim.lr_scheduler.LambdaLR(opt, lr_factor)
 
     if lg.wandb:
         wandb.init(entity=lg.entity, project=lg.project, name=lg.run_name, config=asdict(cfg))
@@ -125,23 +137,26 @@ def main():
             if t.grad_clip is not None:
                 torch.nn.utils.clip_grad_norm_(unet.parameters(), t.grad_clip)
             opt.step()
+            lr_sched.step()
             step += 1
             pbar.set_postfix(loss=f"{loss.item():.4f}")
             if lg.wandb:
-                wandb.log({"train/loss": loss.item()}, step=step)
-        log = {"epoch": epoch}
-        if valid_loader is not None:
-            log["valid/loss"] = run_valid(unet, scheduler, normalizer, valid_loader, device,
-                                          m.timesteps, t.eval_seed)
-            print(f"epoch {epoch} valid loss: {log['valid/loss']:.4f}")
-        figs = run_eval(unet, scheduler, normalizer, device, t, epoch)
-        if lg.wandb:
-            wandb.log({**log, **{f"samples/{c}": wandb.Image(f) for c, f in figs.items()}}, step=step)
-        for f in figs.values():
-            plt.close(f)
+                wandb.log({"train/loss": loss.item(), "train/lr": lr_sched.get_last_lr()[0]}, step=step)
+        if (epoch + 1) % t.eval_epochs == 0 or epoch + 1 == t.epochs:
+            log = {"epoch": epoch}
+            if valid_loader is not None:
+                log["valid/loss"] = run_valid(unet, scheduler, normalizer, valid_loader, device,
+                                              m.timesteps, t.eval_seed)
+                print(f"epoch {epoch} valid loss: {log['valid/loss']:.4f}")
+            figs = run_eval(unet, scheduler, normalizer, device, t, epoch)
+            if lg.wandb:
+                wandb.log({**log, **{f"samples/{c}": wandb.Image(f) for c, f in figs.items()}}, step=step)
+            for f in figs.values():
+                plt.close(f)
         if (epoch + 1) % t.save_every == 0 or epoch + 1 == t.epochs:
-            save_checkpoint(os.path.join(t.out_dir, "ckpt.pt"), unet, normalizer,
-                            unet_kwargs, m.timesteps, step)
+            ckpt_path = os.path.join(t.out_dir, f"ckpt_epoch_{epoch + 1:04d}.pt")
+            save_checkpoint(ckpt_path, unet, normalizer, unet_kwargs, m.timesteps, step)
+            shutil.copyfile(ckpt_path, os.path.join(t.out_dir, "ckpt.pt"))  # latest, the default for infer.py
     if lg.wandb:
         wandb.finish()
 
