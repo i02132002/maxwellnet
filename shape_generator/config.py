@@ -56,6 +56,7 @@ class ModelConfig:
     layers_per_block: int = 2           # residual blocks per UNet level
     image_size: int = 256               # H = W of the generated images (shapes: 256, mnist: 28)
     timesteps: int = 1000               # DDPM training timesteps
+    vae_ckpt: Optional[str] = None      # trained VAE checkpoint (vae.pt): diffusion runs in its latent space (null = pixel space)
 
     def validate(self):
         b = self.block_out_channels
@@ -71,6 +72,54 @@ class ModelConfig:
                f"model.image_size ({self.image_size}) must be divisible by 2**(levels-1) = "
                f"{2 ** (len(b) - 1)} for {len(b)} block_out_channels entries")
         _check(_is_int(self.timesteps) and self.timesteps > 0, "model.timesteps must be a positive integer")
+        _check(self.vae_ckpt is None or (isinstance(self.vae_ckpt, str) and self.vae_ckpt),
+               "model.vae_ckpt must be a non-empty string or null")
+
+
+@dataclass
+class VAEConfig:
+    """Stage-1 autoencoder (train_vae.py). Its input is data.* images normalized by data.normalization.
+    The latent is image_size / 2**(levels-1) on a side with latent_channels channels."""
+    block_out_channels: List[int] = field(default_factory=lambda: [32, 64, 128])
+    latent_channels: int = 16
+    layers_per_block: int = 1
+    recon_loss: str = "mse"              # "l1" (sharper edges) or "mse"
+    kl_weight: float = 1e-5             # weight on the per-element mean KL(q(z|x) || N(0, 1))
+    epochs: int = 100
+    batch_size: int = 16
+    lr: float = 3e-4
+    lr_schedule: str = "cosine"         # "cosine" (linear warmup, then cosine decay to min_lr) or "constant"
+    min_lr: float = 1e-6                # final lr the cosine decay ends at (must be <= lr)
+    warmup_steps: int = 100             # linear lr warmup steps (optimizer steps, not epochs)
+    grad_clip: Optional[float] = 1.0
+    eval_epochs: int = 1                # run the metrics + reconstruction plots (and push to wandb) every N epochs
+    save_every: int = 5                 # checkpoint every N epochs (vae_epoch_XXXX.pt, plus vae.pt = latest)
+    seed: Optional[int] = 0
+    out_dir: str = "shape_generator/runs/vae"
+
+    def validate(self):
+        b = self.block_out_channels
+        _check(isinstance(b, list) and len(b) >= 2 and all(_is_int(c) and c > 0 for c in b),
+               "vae.block_out_channels must be a list of >= 2 positive integers")
+        _check(all(c % 8 == 0 for c in b), "vae.block_out_channels entries must be divisible by 8 (GroupNorm)")
+        _check(_is_int(self.latent_channels) and self.latent_channels > 0,
+               "vae.latent_channels must be a positive integer")
+        _check(_is_int(self.layers_per_block) and self.layers_per_block > 0,
+               "vae.layers_per_block must be a positive integer")
+        _check(self.recon_loss in ("l1", "mse"), 'vae.recon_loss must be "l1" or "mse"')
+        _check(_is_num(self.kl_weight) and self.kl_weight >= 0, "vae.kl_weight must be a number >= 0")
+        _check(_is_int(self.epochs) and self.epochs > 0, "vae.epochs must be a positive integer")
+        _check(_is_int(self.batch_size) and self.batch_size > 0, "vae.batch_size must be a positive integer")
+        _check(_is_num(self.lr) and self.lr > 0, "vae.lr must be a positive number")
+        _check(self.lr_schedule in ("cosine", "constant"), 'vae.lr_schedule must be "cosine" or "constant"')
+        _check(_is_num(self.min_lr) and 0 <= self.min_lr <= self.lr, "vae.min_lr must be a number in [0, lr]")
+        _check(_is_int(self.warmup_steps) and self.warmup_steps >= 0, "vae.warmup_steps must be an integer >= 0")
+        _check(self.grad_clip is None or (_is_num(self.grad_clip) and self.grad_clip > 0),
+               "vae.grad_clip must be a positive number or null")
+        _check(_is_int(self.eval_epochs) and self.eval_epochs > 0, "vae.eval_epochs must be a positive integer")
+        _check(_is_int(self.save_every) and self.save_every > 0, "vae.save_every must be a positive integer")
+        _check(self.seed is None or _is_int(self.seed), "vae.seed must be an integer or null")
+        _check(isinstance(self.out_dir, str) and self.out_dir, "vae.out_dir must be a non-empty string")
 
 
 @dataclass
@@ -139,6 +188,7 @@ class InferenceConfig:
 class Config:
     data: DataConfig = field(default_factory=DataConfig)
     model: ModelConfig = field(default_factory=ModelConfig)
+    vae: VAEConfig = field(default_factory=VAEConfig)
     train: TrainConfig = field(default_factory=TrainConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
     inference: InferenceConfig = field(default_factory=InferenceConfig)

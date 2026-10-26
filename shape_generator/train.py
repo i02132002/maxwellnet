@@ -1,9 +1,11 @@
 """Train a small DDPM UNet on optical_constant_{real,imag} images (shapes or MNIST).
 
+With model.vae_ckpt set, the UNet instead diffuses in the latent space of that (frozen) VAE; train it first with
+python -m shape_generator.train_vae. Images are encoded on the fly (a fresh posterior sample per batch).
+
 Run from the repo root:  python -m shape_generator.train [--config path/to/config.json]
 """
 import argparse
-import math
 from dataclasses import asdict
 import os
 import shutil
@@ -17,18 +19,12 @@ import wandb
 from tqdm import tqdm
 
 from shape_generator.config import DEFAULT_PATH, load_config  # noqa: E402
+from shape_generator.data import compute_normalizer, load_data  # noqa: E402
 from shape_generator.infer import plot_grid, sample  # noqa: E402
-from shape_generator.mnist import load_mnist  # noqa: E402
-from shape_generator.shapes import load_new_shapes  # noqa: E402
 from shape_generator.model import (  # noqa: E402
-    Normalizer, build_scheduler, build_unet, save_checkpoint,
+    LatentCodec, build_scheduler, build_unet, save_checkpoint,
 )
-
-
-def compute_normalizer(dataset, mode, n=256):
-    idx = torch.randperm(len(dataset))[:min(n, len(dataset))].tolist()
-    imgs = torch.stack([dataset[i]["optical_constant_image"] for i in idx])
-    return Normalizer.fit(imgs, mode)
+from shape_generator.schedule import make_lr_scheduler  # noqa: E402
 
 
 def run_eval(unet, scheduler, normalizer, device, t, epoch):
@@ -78,45 +74,38 @@ def main():
     if t.seed is not None:
         torch.manual_seed(t.seed)
 
-    if d.dataset == "mnist" and m.image_size != 28:
-        raise ValueError(f"data.dataset='mnist' has 28x28 images but model.image_size={m.image_size}")
-    if d.dataset == "mnist":
-        train_ds, valid_ds = load_mnist(d.mnist_root, d.n_samples, d.valid_fraction)
-    else:
-        train_ds, valid_ds = load_new_shapes(
-            d.num_files, d.component, d.n_samples, d.valid_fraction, t.seed if t.seed is not None else 0,
-            m.image_size)
-    print(f"train shapes: {len(train_ds)}, valid shapes: {len(valid_ds)}")
+    train_ds, valid_ds = load_data(cfg)
     valid_loader = None
     if len(valid_ds) > 0:
         valid_loader = torch.utils.data.DataLoader(valid_ds, batch_size=t.batch_size, shuffle=False,
                                                    num_workers=d.num_workers)
     loader = torch.utils.data.DataLoader(train_ds, batch_size=t.batch_size, shuffle=True,
                                          num_workers=d.num_workers, drop_last=True)
-    normalizer = compute_normalizer(train_ds, d.normalization)
-    print("normalizer:", normalizer.state_dict())
+    if m.vae_ckpt is not None:
+        normalizer = LatentCodec.from_checkpoint(m.vae_ckpt, device)
+        f, vk = normalizer.downsample, normalizer.vae_kwargs
+        if vk["image_size"] != m.image_size:
+            raise ValueError(f"VAE {m.vae_ckpt} was trained at image_size={vk['image_size']} "
+                             f"but model.image_size={m.image_size}")
+        net_size, net_channels = m.image_size // f, normalizer.latent_channels
+        print(f"latent diffusion: {m.image_size}px -> {net_channels}x{net_size}x{net_size} latents "
+              f"(scale_factor {normalizer.scale_factor:.3f})")
+    else:
+        normalizer = compute_normalizer(train_ds, d.normalization)
+        net_size, net_channels = m.image_size, 2
+    print("normalizer:", normalizer.describe())
+    if net_size % 2 ** (len(m.block_out_channels) - 1):
+        raise ValueError(f"UNet input size ({net_size}) must be divisible by 2**(levels-1) = "
+                         f"{2 ** (len(m.block_out_channels) - 1)}")
 
-    unet_kwargs = {"block_out_channels": m.block_out_channels, "image_size": m.image_size,
-                   "layers_per_block": m.layers_per_block,
+    unet_kwargs = {"block_out_channels": m.block_out_channels, "image_size": net_size,
+                   "layers_per_block": m.layers_per_block, "channels": net_channels,
                    "attention_levels": m.attention_levels}
     unet = build_unet(**unet_kwargs).to(device)
-    scheduler = build_scheduler(m.timesteps, clip_sample=normalizer.bounded)
+    scheduler = build_scheduler(m.timesteps, normalizer.clip_range)
     print(f"UNet params: {sum(p.numel() for p in unet.parameters()) / 1e6:.1f}M")
     opt = torch.optim.AdamW(unet.parameters(), lr=t.lr)
-    total_steps = t.epochs * len(loader)
-    if t.warmup_steps >= total_steps:
-        raise ValueError(f"train.warmup_steps ({t.warmup_steps}) must be < total steps ({total_steps})")
-
-    def lr_factor(step):
-        if step < t.warmup_steps:
-            return (step + 1) / t.warmup_steps
-        if t.lr_schedule == "constant":
-            return 1.0
-        progress = (step - t.warmup_steps) / (total_steps - t.warmup_steps)
-        floor = t.min_lr / t.lr
-        return floor + (1 - floor) * 0.5 * (1 + math.cos(math.pi * progress))
-
-    lr_sched = torch.optim.lr_scheduler.LambdaLR(opt, lr_factor)
+    lr_sched = make_lr_scheduler(opt, t.lr_schedule, t.lr, t.min_lr, t.warmup_steps, t.epochs * len(loader))
 
     if lg.wandb:
         wandb.init(entity=lg.entity, project=lg.project, name=lg.run_name, config=asdict(cfg))
@@ -127,7 +116,7 @@ def main():
         unet.train()
         pbar = tqdm(loader, desc=f"epoch {epoch}")
         for batch in pbar:
-            x0 = normalizer.encode(batch["optical_constant_image"]).to(device)
+            x0 = normalizer.encode(batch["optical_constant_image"], sample=True).to(device)
             noise = torch.randn_like(x0)
             ts = torch.randint(0, m.timesteps, (x0.shape[0],), device=device)
             xt = scheduler.add_noise(x0, noise, ts)

@@ -10,7 +10,7 @@ import torch
 from tqdm import tqdm
 
 from shape_generator.config import DEFAULT_PATH, load_config
-from shape_generator.model import IN_CHANNELS, load_checkpoint
+from shape_generator.model import load_checkpoint
 
 
 @torch.no_grad()
@@ -19,7 +19,7 @@ def sample(unet, scheduler, normalizer, n, device, steps=None, seed=None):
     if seed is not None:
         gen.manual_seed(seed)
     size = unet.config.sample_size
-    x = torch.randn(n, IN_CHANNELS, size, size, generator=gen).to(device)
+    x = torch.randn(n, unet.config.in_channels, size, size, generator=gen).to(device)
     if steps is not None:
         scheduler.set_timesteps(steps)
     else:
