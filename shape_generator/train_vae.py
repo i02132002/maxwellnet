@@ -22,7 +22,7 @@ from tqdm import tqdm  # noqa: E402
 
 from shape_generator.config import DEFAULT_PATH, load_config  # noqa: E402
 from shape_generator.data import compute_normalizer, load_data  # noqa: E402
-from shape_generator.model import build_vae, save_vae_checkpoint  # noqa: E402
+from shape_generator.model import Normalizer, build_vae, save_vae_checkpoint  # noqa: E402
 from shape_generator.schedule import make_lr_scheduler  # noqa: E402
 
 CHANNELS = ("real", "imag")
@@ -217,12 +217,24 @@ def main():
     eval_name = "valid" if len(valid_ds) > 0 else "train_subset"
     eval_loader = torch.utils.data.DataLoader(eval_ds, batch_size=v.batch_size, shuffle=False,
                                               num_workers=d.num_workers)
-    normalizer = compute_normalizer(train_ds, d.normalization)
-    print("pixel normalizer:", normalizer.describe())
-
     vae_kwargs = {"block_out_channels": v.block_out_channels, "latent_channels": v.latent_channels,
                   "layers_per_block": v.layers_per_block, "image_size": m.image_size}
+    start_step = 0
+    if v.resume:
+        ckpt = torch.load(v.resume, map_location="cpu")
+        if {k: ckpt["vae_kwargs"][k] for k in vae_kwargs} != {k: list(x) if isinstance(x, tuple) else x
+                                                              for k, x in vae_kwargs.items()}:
+            raise ValueError(f"vae.resume {v.resume} was built with {ckpt['vae_kwargs']}, config has {vae_kwargs}")
+        normalizer = Normalizer.from_state_dict(ckpt["pixel_normalizer"])  # must match what the weights were trained on
+        start_step = ckpt["step"]
+        print(f"resuming from {v.resume} (step {start_step}); optimizer and lr schedule restart")
+    else:
+        normalizer = compute_normalizer(train_ds, d.normalization)
+    print("pixel normalizer:", normalizer.describe())
+
     vae = build_vae(**vae_kwargs).to(device)
+    if v.resume:
+        vae.load_state_dict(ckpt["vae"])
     lat = m.image_size // factor
     print(f"VAE params: {sum(q.numel() for q in vae.parameters()) / 1e6:.1f}M; "
           f"{2}x{m.image_size}x{m.image_size} -> {v.latent_channels}x{lat}x{lat} "
@@ -234,8 +246,11 @@ def main():
         wandb.init(entity=lg.entity, project=lg.project, name=lg.run_name, job_type="vae", config=asdict(cfg))
         wandb.save(config_path, base_path=os.path.dirname(os.path.abspath(config_path)), policy="now")
 
-    step = 0
-    for epoch in range(v.epochs):
+    # epoch numbers (checkpoint names, logs) continue from the resumed run
+    start_epoch = start_step // len(loader)
+    last_epoch = start_epoch + v.epochs
+    step = start_step
+    for epoch in range(start_epoch, last_epoch):
         vae.train()
         pbar = tqdm(loader, desc=f"vae epoch {epoch}")
         for batch in pbar:
@@ -258,7 +273,7 @@ def main():
                            **{f"vae_train/recon_{c}": r for c, r in zip(CHANNELS, rl_ch.tolist())},
                            "vae_train/lr": lr_sched.get_last_lr()[0]}, step=step)
 
-        if (epoch + 1) % v.eval_epochs == 0 or epoch + 1 == v.epochs:
+        if (epoch + 1) % v.eval_epochs == 0 or epoch + 1 == last_epoch:
             metrics, (x_first, rec_first) = run_metrics(vae, normalizer, eval_loader, device)
             print(f"epoch {epoch} [{eval_name}] mse {metrics['recon/mse_mean']:.5f} "
                   f"(sampled z {metrics['recon/mse_sampled']:.5f}) "
@@ -274,7 +289,7 @@ def main():
             for f in figs.values():
                 plt.close(f)
 
-        if (epoch + 1) % v.save_every == 0 or epoch + 1 == v.epochs:
+        if (epoch + 1) % v.save_every == 0 or epoch + 1 == last_epoch:
             scale = estimate_scale_factor(vae, normalizer, train_ds, device)
             ckpt_path = os.path.join(v.out_dir, f"vae_epoch_{epoch + 1:04d}.pt")
             save_vae_checkpoint(ckpt_path, vae, vae_kwargs, normalizer, scale, step)

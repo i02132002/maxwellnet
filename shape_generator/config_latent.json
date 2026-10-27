@@ -23,6 +23,7 @@
     "vae_ckpt": "shape_generator/runs/vae/vae.pt"
   },
   "vae": {
+    "resume": "shape_generator/runs/vae/vae.pt",
     "block_out_channels": [
       32,
       64,

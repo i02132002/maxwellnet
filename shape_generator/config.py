@@ -99,6 +99,7 @@ class VAEConfig:
     save_every: int = 5                 # checkpoint every N epochs (vae_epoch_XXXX.pt, plus vae.pt = latest)
     seed: Optional[int] = 0
     out_dir: str = "shape_generator/runs/vae"
+    resume: Optional[str] = None        # vae checkpoint to continue from (weights, pixel normalizer, step); runs `epochs` more
 
     def validate(self):
         b = self.block_out_channels
@@ -123,6 +124,8 @@ class VAEConfig:
         _check(_is_int(self.save_every) and self.save_every > 0, "vae.save_every must be a positive integer")
         _check(self.seed is None or _is_int(self.seed), "vae.seed must be an integer or null")
         _check(isinstance(self.out_dir, str) and self.out_dir, "vae.out_dir must be a non-empty string")
+        _check(self.resume is None or (isinstance(self.resume, str) and self.resume),
+               "vae.resume must be a non-empty string or null")
 
 
 @dataclass
