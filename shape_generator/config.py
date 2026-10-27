@@ -28,8 +28,9 @@ def _is_num(v):
 class DataConfig:
     dataset: str = "shapes"             # "shapes" (ShapeDataset) or "mnist" (sanity-check dataset)
     mnist_root: str = "shape_generator/data"  # where MNIST is downloaded
-    num_files: Optional[int] = 10       # number of new-schema parquet shards to use, null = all (shapes only)
-    component: int = 2                  # which of optical_constant's 3 components to use (shapes only)
+    num_files: Optional[int] = None     # number of general-shapes-1m parquet shards (of 4) to use, null = all (shapes only)
+    component: int = 2                  # which tensor component to render: 0 = xx, 1 = yy, 2 = zz (shapes only)
+    max_oc_value: Optional[float] = 0.1  # drop shapes whose delta or beta exceeds this, null = keep all (shapes only)
     n_samples: Optional[int] = None     # number of training samples to use (null = all)
     num_workers: int = 4                # DataLoader workers
     valid_fraction: float = 0.1         # fraction of unique shapes held out for validation (0 = none)
@@ -41,6 +42,8 @@ class DataConfig:
         _check(self.num_files is None or (_is_int(self.num_files) and self.num_files > 0),
                "data.num_files must be a positive integer or null")
         _check(self.component in (0, 1, 2), "data.component must be 0, 1 or 2")
+        _check(self.max_oc_value is None or (_is_num(self.max_oc_value) and self.max_oc_value > 0),
+               "data.max_oc_value must be a positive number or null")
         _check(self.n_samples is None or (_is_int(self.n_samples) and self.n_samples > 0),
                "data.n_samples must be a positive integer or null")
         _check(_is_int(self.num_workers) and self.num_workers >= 0, "data.num_workers must be an integer >= 0")

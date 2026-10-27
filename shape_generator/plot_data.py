@@ -11,8 +11,7 @@ import torch
 
 from shape_generator.config import DEFAULT_PATH, load_config
 from shape_generator.infer import plot_grid
-from shape_generator.mnist import load_mnist
-from shape_generator.shapes import load_new_shapes
+from shape_generator.data import load_data
 
 
 def main():
@@ -24,17 +23,11 @@ def main():
                    help="output path; _real / _imag is inserted before the extension")
     args = p.parse_args()
     cfg = load_config(args.config)
-    d, t, m = cfg.data, cfg.train, cfg.model
 
-    if d.dataset == "mnist":
-        train_ds, valid_ds = load_mnist(d.mnist_root, d.n_samples, d.valid_fraction)
-    else:
-        train_ds, valid_ds = load_new_shapes(
-            d.num_files, d.component, d.n_samples, d.valid_fraction, t.seed if t.seed is not None else 0,
-            m.image_size)
+    train_ds, valid_ds = load_data(cfg)
     ds = train_ds if args.split == "train" else valid_ds
     if len(ds) == 0:
-        raise ValueError(f"the {args.split} split is empty (data.valid_fraction={d.valid_fraction})")
+        raise ValueError(f"the {args.split} split is empty (data.valid_fraction={cfg.data.valid_fraction})")
 
     gen = torch.Generator().manual_seed(args.seed) if args.seed is not None else None
     idx = torch.randperm(len(ds), generator=gen)[:9].tolist()

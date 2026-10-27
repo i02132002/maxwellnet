@@ -3,7 +3,7 @@ import torch
 
 from shape_generator.mnist import load_mnist
 from shape_generator.model import Normalizer
-from shape_generator.shapes import load_new_shapes
+from shape_generator.shapes import load_general_shapes
 
 
 def load_data(cfg):
@@ -15,8 +15,8 @@ def load_data(cfg):
         train_ds, valid_ds = load_mnist(d.mnist_root, d.n_samples, d.valid_fraction)
     else:
         seed = cfg.train.seed if cfg.train.seed is not None else 0
-        train_ds, valid_ds = load_new_shapes(
-            d.num_files, d.component, d.n_samples, d.valid_fraction, seed, m.image_size)
+        train_ds, valid_ds = load_general_shapes(
+            d.num_files, d.component, d.n_samples, d.valid_fraction, seed, m.image_size, d.max_oc_value)
     print(f"train shapes: {len(train_ds)}, valid shapes: {len(valid_ds)}")
     return train_ds, valid_ds
 
