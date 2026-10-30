@@ -4,7 +4,7 @@
     "(als-rixs/latent-image-training, s-pol) using the periodic-x/PML-z",
     "Helmholtz residual loss."
   ],
-  "NetworkArch": "swin",
+  "NetworkArch": "maxwellnet",
   "NetworkSpecs": {
     "depth": 5,
     "filter": 16,
@@ -35,9 +35,9 @@
   "SnapshotFrequency": 1000,
   "SaveEField": false,
   "WandB": {
-    "Project": "maxwellnet",
+    "Project": "maxwellnet-supervised",
     "Entity": "als-rixs",
     "Mode": "online",
-    "LogFrequency": 100
+    "LogFrequency": 1
   }
 }

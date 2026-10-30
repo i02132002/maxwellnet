@@ -36,6 +36,12 @@ class ShapeDataset(torch.utils.data.Dataset):
                 'x0_A', 'y0_A', 'z0_A', 'grid_nx', 'grid_ny', 'pol', 'theta',
                 'e_field_real', 'e_field_imag']
 
+    # The repo's `training/` folder mixes two parquet schemas: the first two
+    # files match the declared features (257x257x3 Array3D etc.), the ~110
+    # newer train-000NN-of-000MM files use a flat list schema that
+    # load_dataset can't cast to them (CastError), so only read these two.
+    _DATA_FILES = ["training/train-00000-of-00001.parquet", "training/train-00001-of-00002.parquet"]
+
     # These four are stored server-side as Arrow `Array3D` (fixed shape
     # (257, 257, 3), float32) -- set_format below decodes them straight into
     # torch tensors via pyarrow's native array conversion. The other
@@ -94,6 +100,7 @@ class ShapeDataset(torch.utils.data.Dataset):
         pol = 's' if mode == 'te' else 'p'
         raw = load_dataset(
             "als-rixs/latent-image-training", config, split="train", revision="fixed-dimension",
+            data_files=cls._DATA_FILES,
         )
         # .filter(lambda r: ...) materializes every selected column (Python
         # dict per row) just to evaluate the predicate -- even restricted to

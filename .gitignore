@@ -9,5 +9,9 @@ tensorboard*
 test_data/
 test_run1/
 examples/
+shape_generator/data/
+shape_generator/runs/
+shape_generator/*.png
+wandb/
 
 *__pycache__*
