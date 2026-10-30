@@ -4,7 +4,7 @@ Run from the repo root:  python -m shape_generator.train_vae [--config path/to/c
 Then set model.vae_ckpt to <vae.out_dir>/vae.pt and run shape_generator.train.
 
 Loss = recon (l1 | mse) in normalized pixel space + kl_weight * per-element mean KL(q(z|x) || N(0, 1)).
-Every vae.eval_epochs the script logs reconstruction / latent-health metrics (see run_metrics) and
+Every vae.ckpt_every steps (the same steps vae_step_XXXXXX.pt / vae.pt are saved) the script logs reconstruction / latent-health metrics (see run_metrics) and
 input / recon / |error| plots, on the validation split (or a fixed train subset if there is none).
 """
 import argparse
@@ -246,11 +246,30 @@ def main():
         wandb.init(entity=lg.entity, project=lg.project, name=lg.run_name, job_type="vae", config=asdict(cfg))
         wandb.save(config_path, base_path=os.path.dirname(os.path.abspath(config_path)), policy="now")
 
-    # epoch numbers (checkpoint names, logs) continue from the resumed run
-    start_epoch = start_step // len(loader)
-    last_epoch = start_epoch + v.epochs
+    def run_eval_and_ckpt(step):
+        metrics, (x_first, rec_first) = run_metrics(vae, normalizer, eval_loader, device)
+        print(f"step {step} [{eval_name}] mse {metrics['recon/mse_mean']:.5f} "
+              f"(sampled z {metrics['recon/mse_sampled']:.5f}) "
+              f"r2 real/imag {metrics['recon/r2_real']:.4f}/{metrics['recon/r2_imag']:.4f} "
+              f"kl {metrics['latent/kl_mean']:.3f} active {metrics['latent/active_channels']}/{v.latent_channels} "
+              f"scale {metrics['latent/scale_factor']:.3f}")
+        figs = {c: plot_recon(x_first, rec_first, normalizer, c,
+                              os.path.join(v.out_dir, "recon", f"step_{step:06d}_{c}.png"))
+                for c in CHANNELS}
+        if lg.wandb:
+            wandb.log({**{f"vae_{eval_name}/{k}": val for k, val in metrics.items()},
+                       **{f"vae_recon/{c}": wandb.Image(f) for c, f in figs.items()}}, step=step)
+        for f in figs.values():
+            plt.close(f)
+        scale = estimate_scale_factor(vae, normalizer, train_ds, device)
+        ckpt_path = os.path.join(v.out_dir, f"vae_step_{step:06d}.pt")
+        save_vae_checkpoint(ckpt_path, vae, vae_kwargs, normalizer, scale, step)
+        shutil.copyfile(ckpt_path, os.path.join(v.out_dir, "vae.pt"))  # latest, what model.vae_ckpt points at
+
+    # step numbers (checkpoint names, logs) continue from the resumed run
     step = start_step
-    for epoch in range(start_epoch, last_epoch):
+    last_step = start_step + v.epochs * len(loader)
+    for epoch in range(v.epochs):
         vae.train()
         pbar = tqdm(loader, desc=f"vae epoch {epoch}")
         for batch in pbar:
@@ -273,27 +292,9 @@ def main():
                            **{f"vae_train/recon_{c}": r for c, r in zip(CHANNELS, rl_ch.tolist())},
                            "vae_train/lr": lr_sched.get_last_lr()[0]}, step=step)
 
-        if (epoch + 1) % v.eval_epochs == 0 or epoch + 1 == last_epoch:
-            metrics, (x_first, rec_first) = run_metrics(vae, normalizer, eval_loader, device)
-            print(f"epoch {epoch} [{eval_name}] mse {metrics['recon/mse_mean']:.5f} "
-                  f"(sampled z {metrics['recon/mse_sampled']:.5f}) "
-                  f"r2 real/imag {metrics['recon/r2_real']:.4f}/{metrics['recon/r2_imag']:.4f} "
-                  f"kl {metrics['latent/kl_mean']:.3f} active {metrics['latent/active_channels']}/{v.latent_channels} "
-                  f"scale {metrics['latent/scale_factor']:.3f}")
-            figs = {c: plot_recon(x_first, rec_first, normalizer, c,
-                                  os.path.join(v.out_dir, "recon", f"epoch_{epoch + 1:04d}_{c}.png"))
-                    for c in CHANNELS}
-            if lg.wandb:
-                wandb.log({"epoch": epoch, **{f"vae_{eval_name}/{k}": val for k, val in metrics.items()},
-                           **{f"vae_recon/{c}": wandb.Image(f) for c, f in figs.items()}}, step=step)
-            for f in figs.values():
-                plt.close(f)
-
-        if (epoch + 1) % v.save_every == 0 or epoch + 1 == last_epoch:
-            scale = estimate_scale_factor(vae, normalizer, train_ds, device)
-            ckpt_path = os.path.join(v.out_dir, f"vae_epoch_{epoch + 1:04d}.pt")
-            save_vae_checkpoint(ckpt_path, vae, vae_kwargs, normalizer, scale, step)
-            shutil.copyfile(ckpt_path, os.path.join(v.out_dir, "vae.pt"))  # latest, what model.vae_ckpt points at
+            if step % v.ckpt_every == 0 or step == last_step:  # eval and checkpoint at the same steps
+                run_eval_and_ckpt(step)
+                vae.train()  # run_metrics / estimate_scale_factor leave the VAE in eval mode
     if lg.wandb:
         wandb.finish()
 

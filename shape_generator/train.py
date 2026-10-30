@@ -27,14 +27,14 @@ from shape_generator.model import (  # noqa: E402
 from shape_generator.schedule import make_lr_scheduler  # noqa: E402
 
 
-def run_eval(unet, scheduler, normalizer, device, t, epoch):
-    """Sample 9 shapes from the same fixed noise every epoch; save + return the 3x3 figures."""
+def run_eval(unet, scheduler, normalizer, device, t, step):
+    """Sample 9 shapes from the same fixed noise every eval; save + return the 3x3 figures."""
     unet.eval()
     images = sample(unet, scheduler, normalizer, 9, device, t.eval_diffusion_timesteps, t.eval_seed)
     unet.train()
     figs = {}
     for channel in ("real", "imag"):
-        path = os.path.join(t.out_dir, "samples", f"epoch_{epoch:03d}_{channel}.png")
+        path = os.path.join(t.out_dir, "samples", f"step_{step:06d}_{channel}.png")
         os.makedirs(os.path.dirname(path), exist_ok=True)
         figs[channel] = plot_grid(images, channel, path)
     return figs
@@ -43,7 +43,7 @@ def run_eval(unet, scheduler, normalizer, device, t, epoch):
 @torch.no_grad()
 def run_valid(unet, scheduler, normalizer, loader, device, num_timesteps, seed):
     """Mean noise-prediction MSE over the validation set. Timesteps and noise
-    come from a seeded generator, so the number is comparable across epochs."""
+    come from a seeded generator, so the number is comparable across evals."""
     unet.eval()
     gen = torch.Generator(device="cpu").manual_seed(seed)
     total, n = 0.0, 0
@@ -112,6 +112,7 @@ def main():
         wandb.save(config_path, base_path=os.path.dirname(os.path.abspath(config_path)), policy="now")
 
     step = 0
+    last_step = t.epochs * len(loader)
     for epoch in range(t.epochs):
         unet.train()
         pbar = tqdm(loader, desc=f"epoch {epoch}")
@@ -131,21 +132,20 @@ def main():
             pbar.set_postfix(loss=f"{loss.item():.4f}")
             if lg.wandb:
                 wandb.log({"train/loss": loss.item(), "train/lr": lr_sched.get_last_lr()[0]}, step=step)
-        if (epoch + 1) % t.eval_epochs == 0 or epoch + 1 == t.epochs:
-            log = {"epoch": epoch}
-            if valid_loader is not None:
-                log["valid/loss"] = run_valid(unet, scheduler, normalizer, valid_loader, device,
-                                              m.timesteps, t.eval_seed)
-                print(f"epoch {epoch} valid loss: {log['valid/loss']:.4f}")
-            figs = run_eval(unet, scheduler, normalizer, device, t, epoch)
-            if lg.wandb:
-                wandb.log({**log, **{f"samples/{c}": wandb.Image(f) for c, f in figs.items()}}, step=step)
-            for f in figs.values():
-                plt.close(f)
-        if (epoch + 1) % t.save_every == 0 or epoch + 1 == t.epochs:
-            ckpt_path = os.path.join(t.out_dir, f"ckpt_epoch_{epoch + 1:04d}.pt")
-            save_checkpoint(ckpt_path, unet, normalizer, unet_kwargs, m.timesteps, step)
-            shutil.copyfile(ckpt_path, os.path.join(t.out_dir, "ckpt.pt"))  # latest, the default for infer.py
+            if step % t.ckpt_every == 0 or step == last_step:  # eval and checkpoint at the same steps
+                log = {}
+                if valid_loader is not None:
+                    log["valid/loss"] = run_valid(unet, scheduler, normalizer, valid_loader, device,
+                                                  m.timesteps, t.eval_seed)
+                    print(f"step {step} valid loss: {log['valid/loss']:.4f}")
+                figs = run_eval(unet, scheduler, normalizer, device, t, step)
+                if lg.wandb:
+                    wandb.log({**log, **{f"samples/{c}": wandb.Image(f) for c, f in figs.items()}}, step=step)
+                for f in figs.values():
+                    plt.close(f)
+                ckpt_path = os.path.join(t.out_dir, f"ckpt_step_{step:06d}.pt")
+                save_checkpoint(ckpt_path, unet, normalizer, unet_kwargs, m.timesteps, step)
+                shutil.copyfile(ckpt_path, os.path.join(t.out_dir, "ckpt.pt"))  # latest, the default for infer.py
     if lg.wandb:
         wandb.finish()
 

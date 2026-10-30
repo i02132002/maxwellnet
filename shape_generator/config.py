@@ -71,7 +71,8 @@ class ModelConfig:
         _check(_is_int(self.layers_per_block) and self.layers_per_block > 0,
                "model.layers_per_block must be a positive integer")
         _check(_is_int(self.image_size) and self.image_size > 0, "model.image_size must be a positive integer")
-        _check(self.image_size % (2 ** (len(b) - 1)) == 0,
+        # in latent mode the UNet sees the VAE's latent, not the image; train.py checks that size at run time
+        _check(self.vae_ckpt is not None or self.image_size % (2 ** (len(b) - 1)) == 0,
                f"model.image_size ({self.image_size}) must be divisible by 2**(levels-1) = "
                f"{2 ** (len(b) - 1)} for {len(b)} block_out_channels entries")
         _check(_is_int(self.timesteps) and self.timesteps > 0, "model.timesteps must be a positive integer")
@@ -95,8 +96,8 @@ class VAEConfig:
     min_lr: float = 1e-6                # final lr the cosine decay ends at (must be <= lr)
     warmup_steps: int = 100             # linear lr warmup steps (optimizer steps, not epochs)
     grad_clip: Optional[float] = 1.0
-    eval_epochs: int = 1                # run the metrics + reconstruction plots (and push to wandb) every N epochs
-    save_every: int = 5                 # checkpoint every N epochs (vae_epoch_XXXX.pt, plus vae.pt = latest)
+    ckpt_every: int = 500               # every N optimizer steps: checkpoint (vae_step_XXXXXX.pt, plus vae.pt = latest)
+                                        # and run the metrics + reconstruction plots (pushed to wandb)
     seed: Optional[int] = 0
     out_dir: str = "shape_generator/runs/vae"
     resume: Optional[str] = None        # vae checkpoint to continue from (weights, pixel normalizer, step); runs `epochs` more
@@ -120,8 +121,7 @@ class VAEConfig:
         _check(_is_int(self.warmup_steps) and self.warmup_steps >= 0, "vae.warmup_steps must be an integer >= 0")
         _check(self.grad_clip is None or (_is_num(self.grad_clip) and self.grad_clip > 0),
                "vae.grad_clip must be a positive number or null")
-        _check(_is_int(self.eval_epochs) and self.eval_epochs > 0, "vae.eval_epochs must be a positive integer")
-        _check(_is_int(self.save_every) and self.save_every > 0, "vae.save_every must be a positive integer")
+        _check(_is_int(self.ckpt_every) and self.ckpt_every > 0, "vae.ckpt_every must be a positive integer")
         _check(self.seed is None or _is_int(self.seed), "vae.seed must be an integer or null")
         _check(isinstance(self.out_dir, str) and self.out_dir, "vae.out_dir must be a non-empty string")
         _check(self.resume is None or (isinstance(self.resume, str) and self.resume),
@@ -137,10 +137,10 @@ class TrainConfig:
     min_lr: float = 0.0                 # final lr the cosine decay ends at (must be <= lr)
     warmup_steps: int = 0               # linear lr warmup steps (optimizer steps, not epochs)
     grad_clip: Optional[float] = 1.0    # max grad norm (null = no clipping)
-    save_every: int = 5                 # checkpoint every N epochs
+    ckpt_every: int = 500               # every N optimizer steps: checkpoint (ckpt_step_XXXXXX.pt, plus ckpt.pt = latest)
+                                        # and run the eval (valid loss + sample grid + wandb push)
     seed: Optional[int] = 0
     out_dir: str = "shape_generator/runs/default"
-    eval_epochs: int = 1                # run the eval (valid loss + sample grid + wandb push) every N epochs
     eval_diffusion_timesteps: int = 100               # DDPM sampling steps used for each eval
     eval_seed: int = 0                  # fixed noise seed so every eval starts from the same z
 
@@ -153,10 +153,9 @@ class TrainConfig:
         _check(_is_int(self.warmup_steps) and self.warmup_steps >= 0, "train.warmup_steps must be an integer >= 0")
         _check(self.grad_clip is None or (_is_num(self.grad_clip) and self.grad_clip > 0),
                "train.grad_clip must be a positive number or null")
-        _check(_is_int(self.save_every) and self.save_every > 0, "train.save_every must be a positive integer")
+        _check(_is_int(self.ckpt_every) and self.ckpt_every > 0, "train.ckpt_every must be a positive integer")
         _check(self.seed is None or _is_int(self.seed), "train.seed must be an integer or null")
         _check(isinstance(self.out_dir, str) and self.out_dir, "train.out_dir must be a non-empty string")
-        _check(_is_int(self.eval_epochs) and self.eval_epochs > 0, "train.eval_epochs must be a positive integer")
         _check(_is_int(self.eval_diffusion_timesteps) and self.eval_diffusion_timesteps > 0, "train.eval_diffusion_timesteps must be a positive integer")
         _check(_is_int(self.eval_seed), "train.eval_seed must be an integer")
 
