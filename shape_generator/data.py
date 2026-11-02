@@ -21,7 +21,7 @@ def load_data(cfg):
     return train_ds, valid_ds
 
 
-def compute_normalizer(dataset, mode, n=256):
+def compute_normalizer(dataset, mode, n=256, log=False):
     idx = torch.randperm(len(dataset))[:min(n, len(dataset))].tolist()
     imgs = torch.stack([dataset[i]["optical_constant_image"] for i in idx])
-    return Normalizer.fit(imgs, mode)
+    return Normalizer.fit(imgs, mode, log)

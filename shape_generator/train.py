@@ -77,6 +77,8 @@ def main():
     train_ds, valid_ds = load_data(cfg)
     valid_loader = None
     if len(valid_ds) > 0:
+        if t.eval_samples is not None and len(valid_ds) > t.eval_samples:
+            valid_ds = torch.utils.data.Subset(valid_ds, range(t.eval_samples))  # fixed subset: comparable across steps
         valid_loader = torch.utils.data.DataLoader(valid_ds, batch_size=t.batch_size, shuffle=False,
                                                    num_workers=d.num_workers)
     loader = torch.utils.data.DataLoader(train_ds, batch_size=t.batch_size, shuffle=True,
@@ -91,7 +93,7 @@ def main():
         print(f"latent diffusion: {m.image_size}px -> {net_channels}x{net_size}x{net_size} latents "
               f"(scale_factor {normalizer.scale_factor:.3f})")
     else:
-        normalizer = compute_normalizer(train_ds, d.normalization)
+        normalizer = compute_normalizer(train_ds, d.normalization, log=d.log_transform)
         net_size, net_channels = m.image_size, 2
     print("normalizer:", normalizer.describe())
     if net_size % 2 ** (len(m.block_out_channels) - 1):
@@ -110,6 +112,14 @@ def main():
     if lg.wandb:
         wandb.init(entity=lg.entity, project=lg.project, name=lg.run_name, config=asdict(cfg))
         wandb.save(config_path, base_path=os.path.dirname(os.path.abspath(config_path)), policy="now")
+        model_src = os.path.join(os.path.dirname(os.path.abspath(__file__)), "model.py")
+        wandb.save(model_src, base_path=os.path.dirname(model_src), policy="now")  # the exact model code used
+        n_params = sum(p.numel() for p in unet.parameters())
+        wandb.summary["unet/params_M"] = n_params / 1e6
+        arch_path = os.path.join(t.out_dir, "architecture.txt")
+        with open(arch_path, "w") as f:
+            f.write(f"UNet params: {n_params:,}\n\n{unet}\n\nUNet config:\n{dict(unet.config)}\n")
+        wandb.save(arch_path, base_path=t.out_dir, policy="now")
 
     step = 0
     last_step = t.epochs * len(loader)

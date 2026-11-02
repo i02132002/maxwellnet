@@ -35,6 +35,8 @@ class DataConfig:
     num_workers: int = 4                # DataLoader workers
     valid_fraction: float = 0.1         # fraction of unique shapes held out for validation (0 = none)
     normalization: str = "standard"     # "standard" (zero mean, unit std per channel) or "minmax" (to [-1, 1])
+    log_transform: bool = False         # signed-log the raw values first (sign(x) * log1p(|x| / s), per-channel s), then normalize;
+                                        # compresses the many orders of magnitude of delta / beta. Outputs are exp'd back.
 
     def validate(self):
         _check(self.dataset in ("shapes", "mnist"), 'data.dataset must be "shapes" or "mnist"')
@@ -48,6 +50,7 @@ class DataConfig:
                "data.n_samples must be a positive integer or null")
         _check(_is_int(self.num_workers) and self.num_workers >= 0, "data.num_workers must be an integer >= 0")
         _check(self.normalization in ("standard", "minmax"), 'data.normalization must be "standard" or "minmax"')
+        _check(isinstance(self.log_transform, bool), "data.log_transform must be true or false")
         _check(_is_num(self.valid_fraction) and 0 <= self.valid_fraction < 1,
                "data.valid_fraction must be a number in [0, 1)")
 
@@ -98,6 +101,7 @@ class VAEConfig:
     grad_clip: Optional[float] = 1.0
     ckpt_every: int = 500               # every N optimizer steps: checkpoint (vae_step_XXXXXX.pt, plus vae.pt = latest)
                                         # and run the metrics + reconstruction plots (pushed to wandb)
+    eval_samples: Optional[int] = 512   # evaluate on the first N validation images (null = the whole validation set)
     seed: Optional[int] = 0
     out_dir: str = "shape_generator/runs/vae"
     resume: Optional[str] = None        # vae checkpoint to continue from (weights, pixel normalizer, step); runs `epochs` more
@@ -122,6 +126,8 @@ class VAEConfig:
         _check(self.grad_clip is None or (_is_num(self.grad_clip) and self.grad_clip > 0),
                "vae.grad_clip must be a positive number or null")
         _check(_is_int(self.ckpt_every) and self.ckpt_every > 0, "vae.ckpt_every must be a positive integer")
+        _check(self.eval_samples is None or (_is_int(self.eval_samples) and self.eval_samples > 0),
+               "vae.eval_samples must be a positive integer or null")
         _check(self.seed is None or _is_int(self.seed), "vae.seed must be an integer or null")
         _check(isinstance(self.out_dir, str) and self.out_dir, "vae.out_dir must be a non-empty string")
         _check(self.resume is None or (isinstance(self.resume, str) and self.resume),
@@ -143,6 +149,7 @@ class TrainConfig:
     out_dir: str = "shape_generator/runs/default"
     eval_diffusion_timesteps: int = 100               # DDPM sampling steps used for each eval
     eval_seed: int = 0                  # fixed noise seed so every eval starts from the same z
+    eval_samples: Optional[int] = 512   # valid loss on the first N validation images (null = the whole validation set)
 
     def validate(self):
         _check(_is_int(self.epochs) and self.epochs > 0, "train.epochs must be a positive integer")
@@ -158,6 +165,8 @@ class TrainConfig:
         _check(isinstance(self.out_dir, str) and self.out_dir, "train.out_dir must be a non-empty string")
         _check(_is_int(self.eval_diffusion_timesteps) and self.eval_diffusion_timesteps > 0, "train.eval_diffusion_timesteps must be a positive integer")
         _check(_is_int(self.eval_seed), "train.eval_seed must be an integer")
+        _check(self.eval_samples is None or (_is_int(self.eval_samples) and self.eval_samples > 0),
+               "train.eval_samples must be a positive integer or null")
 
 
 @dataclass

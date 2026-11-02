@@ -214,6 +214,8 @@ def main():
     if len(loader) == 0:
         raise ValueError(f"vae.batch_size ({v.batch_size}) is larger than the train set ({len(train_ds)})")
     eval_ds = valid_ds if len(valid_ds) > 0 else torch.utils.data.Subset(train_ds, range(min(256, len(train_ds))))
+    if v.eval_samples is not None and len(eval_ds) > v.eval_samples:
+        eval_ds = torch.utils.data.Subset(eval_ds, range(v.eval_samples))  # fixed subset: comparable across steps
     eval_name = "valid" if len(valid_ds) > 0 else "train_subset"
     eval_loader = torch.utils.data.DataLoader(eval_ds, batch_size=v.batch_size, shuffle=False,
                                               num_workers=d.num_workers)
@@ -226,10 +228,13 @@ def main():
                                                               for k, x in vae_kwargs.items()}:
             raise ValueError(f"vae.resume {v.resume} was built with {ckpt['vae_kwargs']}, config has {vae_kwargs}")
         normalizer = Normalizer.from_state_dict(ckpt["pixel_normalizer"])  # must match what the weights were trained on
+        if normalizer.log != d.log_transform:
+            raise ValueError(f"vae.resume {v.resume} was trained with log_transform={normalizer.log}, "
+                             f"config has data.log_transform={d.log_transform}")
         start_step = ckpt["step"]
         print(f"resuming from {v.resume} (step {start_step}); optimizer and lr schedule restart")
     else:
-        normalizer = compute_normalizer(train_ds, d.normalization)
+        normalizer = compute_normalizer(train_ds, d.normalization, log=d.log_transform)
     print("pixel normalizer:", normalizer.describe())
 
     vae = build_vae(**vae_kwargs).to(device)

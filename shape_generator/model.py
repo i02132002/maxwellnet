@@ -2,6 +2,7 @@
 
 Channel 0 is optical_constant_real, channel 1 is optical_constant_imag.
 """
+import numpy as np
 import torch
 from diffusers import AutoencoderKL, DDPMScheduler, UNet2DModel
 
@@ -55,29 +56,60 @@ def build_vae(block_out_channels=(32, 64, 128, 128), latent_channels=4, layers_p
     )
 
 
-class Normalizer:
-    """Per-channel affine map z = (x - shift) / scale from raw optical constants to model space (and back).
+def _symlog(x, s):
+    """sign(x) * log1p(|x| / s): 0 -> 0, linear for |x| << s, logarithmic for |x| >> s, odd, exactly invertible."""
+    return torch.sign(x) * torch.log1p(x.abs() / s)
 
-    mode "minmax": maps [lo, hi] to [-1, 1] (shift = midpoint, scale = half range); decode clamps to [-1, 1].
-    mode "standard": zero mean, unit std (shift = mean, scale = std); the output is unbounded.
+
+def _symexp(y, s):
+    return torch.sign(y) * s * torch.expm1(y.abs())
+
+
+class Normalizer:
+    """Per-channel map from raw optical constants to model space (and back).
+
+    Optional first step (log_s given): the signed log y = sign(x) * log1p(|x| / log_s) with a per-channel
+    log_s, so values spanning many orders of magnitude (delta / beta) are comparable; decode exps back.
+    Then the per-channel affine map z = (y - shift) / scale:
+      mode "minmax": maps [lo, hi] to [-1, 1] (shift = midpoint, scale = half range); decode clamps to [-1, 1].
+      mode "standard": zero mean, unit std (shift = mean, scale = std); the output is unbounded.
+    shift / scale are fit on the log-space values when the log is used. log_max bounds |y| on decode so the
+    exp cannot overflow on an out-of-range model output.
     """
 
-    def __init__(self, shift, scale, mode="standard"):
+    def __init__(self, shift, scale, mode="standard", log_s=None, log_max=None):
         assert mode in ("minmax", "standard"), mode
         self.shift = torch.as_tensor(shift, dtype=torch.float32).view(1, -1, 1, 1)
         self.scale = torch.as_tensor(scale, dtype=torch.float32).view(1, -1, 1, 1)
         self.mode = mode
+        self.log_s = None if log_s is None else torch.as_tensor(log_s, dtype=torch.float32).view(1, -1, 1, 1)
+        self.log_max = None if log_max is None else torch.as_tensor(log_max, dtype=torch.float32).view(1, -1, 1, 1)
 
     @classmethod
-    def fit(cls, imgs, mode="standard"):
+    def fit(cls, imgs, mode="standard", log=False):
         """imgs: (N, C, H, W) raw images."""
+        log_s = log_max = None
+        if log:
+            # per-channel s = 1st percentile of the nonzero magnitudes: below it the map is ~linear, above it log
+            log_s = torch.ones(imgs.shape[1])
+            for c in range(imgs.shape[1]):
+                mag = imgs[:, c].abs().flatten()
+                mag = mag[mag > 0].numpy()
+                if mag.size:
+                    log_s[c] = float(np.percentile(mag, 1))
+            imgs = _symlog(imgs, log_s.view(1, -1, 1, 1))
+            log_max = imgs.abs().amax(dim=(0, 2, 3)) * 1.25
         if mode == "minmax":
             lo, hi = imgs.amin(dim=(0, 2, 3)), imgs.amax(dim=(0, 2, 3))
             # Guard against a constant channel (e.g. all-zero imag part).
             hi = torch.where(hi - lo < 1e-8, lo + 1.0, hi)
-            return cls((lo + hi) / 2, (hi - lo) / 2, mode)
+            return cls((lo + hi) / 2, (hi - lo) / 2, mode, log_s, log_max)
         mean, std = imgs.mean(dim=(0, 2, 3)), imgs.std(dim=(0, 2, 3))
-        return cls(mean, torch.where(std < 1e-8, torch.ones_like(std), std), mode)
+        return cls(mean, torch.where(std < 1e-8, torch.ones_like(std), std), mode, log_s, log_max)
+
+    @property
+    def log(self):
+        return self.log_s is not None
 
     @property
     def bounded(self):
@@ -88,25 +120,33 @@ class Normalizer:
         return 1.0 if self.bounded else STD_CLIP_RANGE
 
     def encode(self, x, sample=False):  # `sample` is for interface parity with LatentCodec (deterministic here)
+        if self.log:
+            x = _symlog(x, self.log_s.to(x.device))
         return (x - self.shift.to(x.device)) / self.scale.to(x.device)
 
     def decode(self, x):
         if self.bounded:
             x = x.clamp(-1, 1)
-        return x * self.scale.to(x.device) + self.shift.to(x.device)
+        x = x * self.scale.to(x.device) + self.shift.to(x.device)
+        if self.log:
+            m = self.log_max.to(x.device)
+            x = _symexp(torch.minimum(torch.maximum(x, -m), m), self.log_s.to(x.device))
+        return x
 
     def describe(self):
         return self.state_dict()
 
     def state_dict(self):
-        return {"mode": self.mode, "shift": self.shift.flatten().tolist(), "scale": self.scale.flatten().tolist()}
+        return {"mode": self.mode, "shift": self.shift.flatten().tolist(), "scale": self.scale.flatten().tolist(),
+                "log_s": None if not self.log else self.log_s.flatten().tolist(),
+                "log_max": None if not self.log else self.log_max.flatten().tolist()}
 
     @classmethod
     def from_state_dict(cls, d):
         if "lo" in d:  # checkpoints saved before standard scaling existed
             lo, hi = torch.tensor(d["lo"]), torch.tensor(d["hi"])
             return cls((lo + hi) / 2, (hi - lo).clamp_min(1e-12) / 2, "minmax")
-        return cls(d["shift"], d["scale"], d["mode"])
+        return cls(d["shift"], d["scale"], d["mode"], d.get("log_s"), d.get("log_max"))  # no log keys: pre-log checkpoints
 
 
 class LatentCodec:
